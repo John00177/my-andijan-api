@@ -1,0 +1,1173 @@
+// ============================================================================
+// MY ANDIJAN — PRISMA SCHEMA
+// PostgreSQL. Vanilla only — no proprietary extensions (data-localization
+// portability requirement: DB must be relocatable to an Uzbek host).
+//
+// ID strategy: Int @default(autoincrement()) — matches existing auth module,
+// JWT payload, guards, and seed script.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum UserRole {
+  CUSTOMER
+  BUSINESS_OWNER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum Language {
+  UZ
+  RU
+  EN
+}
+
+enum OtpPurpose {
+  PHONE_VERIFY
+  PASSWORD_RESET
+  LOGIN
+}
+
+enum BusinessStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+enum ClaimStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ReviewStatus {
+  PENDING
+  PUBLISHED
+  REJECTED
+  HIDDEN
+}
+
+enum ReportStatus {
+  PENDING
+  RESOLVED
+  DISMISSED
+}
+
+enum ReportReason {
+  SPAM
+  OFFENSIVE
+  FAKE
+  IRRELEVANT
+  PERSONAL_INFO
+  OTHER
+}
+
+enum EventStatus {
+  DRAFT
+  PENDING
+  PUBLISHED
+  REJECTED
+  CANCELLED
+  COMPLETED
+}
+
+enum EventType {
+  CONFERENCE
+  SEMINAR
+  WORKSHOP
+  CONCERT
+  CEREMONY
+  PROMOTION
+  SPORTS
+  EXHIBITION
+  OTHER
+}
+
+enum AttendeeStatus {
+  INTERESTED
+  GOING
+  ATTENDED
+  CANCELLED
+}
+
+enum ProductType {
+  PRODUCT
+  SERVICE
+}
+
+enum ProductUnit {
+  PCS
+  KG
+  G
+  L
+  ML
+  BOX
+  PACK
+  M
+  M2
+  HOUR
+  SESSION
+}
+
+// Advertising is DEFERRED to Phase 2 (ships with Click payments).
+// Tables exist so the module can attach without a core migration.
+enum AdStatus {
+  DRAFT
+  PENDING
+  ACTIVE
+  PAUSED
+  EXPIRED
+  REJECTED
+}
+
+enum AdPlacement {
+  HOMEPAGE_BANNER
+  SEARCH_RESULTS
+  CATEGORY_PAGE
+  BUSINESS_PROFILE
+  SIDEBAR
+}
+
+enum NotificationType {
+  BUSINESS_APPROVED
+  BUSINESS_REJECTED
+  CLAIM_APPROVED
+  CLAIM_REJECTED
+  REVIEW_RECEIVED
+  REVIEW_REPLIED
+  EVENT_APPROVED
+  EVENT_REMINDER
+  AD_APPROVED
+  SYSTEM
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  APPROVE
+  REJECT
+  SUSPEND
+  RESTORE
+  LOGIN
+  ROLE_CHANGE
+}
+
+// ============================================================================
+// IDENTITY & ACCESS
+// ============================================================================
+
+model User {
+  id           Int     @id @default(autoincrement())
+  phone        String  @unique @db.VarChar(20) // +998XXXXXXXXX
+  email        String? @unique @db.VarChar(255)
+  passwordHash String  @map("password_hash")
+  fullName     String  @map("full_name") @db.VarChar(150)
+  avatarUrl    String? @map("avatar_url") @db.VarChar(500)
+
+  // SECURITY: the public /auth/register endpoint MUST reject role=ADMIN.
+  // Admins are created via seed or promoted by an existing admin only.
+  role          UserRole   @default(CUSTOMER)
+  status        UserStatus @default(ACTIVE)
+  phoneVerified Boolean    @default(false) @map("phone_verified")
+  emailVerified Boolean    @default(false) @map("email_verified")
+
+  preferredLanguage    Language @default(UZ) @map("preferred_language")
+  notificationsEnabled Boolean  @default(true) @map("notifications_enabled")
+
+  // marketingConsentAt is nullable — it records WHEN consent was granted, so
+  // it has no value until marketingConsent actually flips to true.
+  marketingConsent   Boolean   @default(false) @map("marketing_consent")
+  marketingConsentAt DateTime? @map("marketing_consent_at")
+
+  // Optional — collected at registration so the profile can be pre-located
+  // before the user ever creates or claims a business. SetNull on delete: a
+  // district being retired shouldn't cascade into deleting user accounts.
+  districtId Int? @map("district_id")
+
+  lastLoginAt DateTime? @map("last_login_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  district         District?       @relation(fields: [districtId], references: [id], onDelete: SetNull)
+  refreshTokens    RefreshToken[]
+  ownedBusinesses  Business[]      @relation("BusinessOwner")
+  reviews          Review[]
+  reviewReplies    ReviewReply[]
+  favorites        Favorite[]
+  eventAttendances EventAttendee[]
+  notifications    Notification[]
+  auditLogs        AuditLog[]      @relation("AuditActor")
+  branchPhotos     BranchPhoto[]   @relation("PhotoUploader")
+
+  claimsSubmitted    BusinessClaim[] @relation("ClaimClaimant")
+  claimsReviewed     BusinessClaim[] @relation("ClaimReviewer")
+  reportsSubmitted   ReviewReport[]  @relation("ReportReporter")
+  reportsResolved    ReviewReport[]  @relation("ReportResolver")
+  businessesVerified Business[]      @relation("BusinessVerifier")
+
+  @@index([role])
+  @@index([status])
+  @@index([deletedAt])
+  @@index([districtId])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  userAgent String?   @map("user_agent") @db.VarChar(500)
+  ipAddress String?   @map("ip_address") @db.VarChar(45)
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// Built now, unused until Phase 2 (Eskiz SMS). Keeps OTP addable without
+// rewriting auth.
+model OtpCode {
+  id        Int        @id @default(autoincrement())
+  phone     String     @db.VarChar(20)
+  codeHash  String     @map("code_hash")
+  purpose   OtpPurpose
+  attempts  Int        @default(0)
+  expiresAt DateTime   @map("expires_at")
+  usedAt    DateTime?  @map("used_at")
+  createdAt DateTime   @default(now()) @map("created_at")
+
+  @@index([phone, purpose])
+  @@index([expiresAt])
+  @@map("otp_codes")
+}
+
+// ============================================================================
+// GEOGRAPHY  —  Region > District > City > (Branch)
+// ============================================================================
+
+model Region {
+  id        Int      @id @default(autoincrement())
+  slug      String   @unique @db.VarChar(100)
+  nameUz    String   @map("name_uz") @db.VarChar(150)
+  nameRu    String   @map("name_ru") @db.VarChar(150)
+  nameEn    String   @map("name_en") @db.VarChar(150)
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  lat       Decimal? @db.Decimal(10, 8)
+  lng       Decimal? @db.Decimal(11, 8)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  districts District[]
+  cities    City[]
+
+  @@index([isActive, sortOrder])
+  @@map("regions")
+}
+
+model District {
+  id        Int      @id @default(autoincrement())
+  regionId  Int      @map("region_id")
+  slug      String   @unique @db.VarChar(100)
+  nameUz    String   @map("name_uz") @db.VarChar(150)
+  nameRu    String   @map("name_ru") @db.VarChar(150)
+  nameEn    String   @map("name_en") @db.VarChar(150)
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  lat       Decimal? @db.Decimal(10, 8)
+  lng       Decimal? @db.Decimal(11, 8)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  region   Region   @relation(fields: [regionId], references: [id], onDelete: Restrict)
+  cities   City[]
+  branches Branch[]
+  events   Event[]
+  users    User[]
+
+  @@index([regionId, isActive, sortOrder])
+  @@map("districts")
+}
+
+// Andijan Region has 14 districts and 11 cities. Cities sit INSIDE districts,
+// EXCEPT region-level cities (Andijan city), which report directly to the
+// region — hence districtId is nullable and isRegionLevel flags the case.
+//
+// Trap this models: Andijan CITY is not Andijon DISTRICT (whose seat is
+// Kuyganyor). Users searching "Andijan" almost always mean the city.
+model City {
+  id            Int      @id @default(autoincrement())
+  regionId      Int      @map("region_id")
+  districtId    Int?     @map("district_id") // null for region-level cities
+  isRegionLevel Boolean  @default(false) @map("is_region_level")
+  slug          String   @unique @db.VarChar(100)
+  nameUz        String   @map("name_uz") @db.VarChar(150)
+  nameRu        String   @map("name_ru") @db.VarChar(150)
+  nameEn        String   @map("name_en") @db.VarChar(150)
+  isActive      Boolean  @default(true) @map("is_active")
+  sortOrder     Int      @default(0) @map("sort_order")
+  lat           Decimal? @db.Decimal(10, 8)
+  lng           Decimal? @db.Decimal(11, 8)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  region   Region    @relation(fields: [regionId], references: [id], onDelete: Restrict)
+  district District? @relation(fields: [districtId], references: [id], onDelete: SetNull)
+  branches Branch[]
+
+  @@index([regionId, isActive, sortOrder])
+  @@index([districtId, isActive])
+  @@index([isRegionLevel])
+  @@map("cities")
+}
+
+// ============================================================================
+// TAXONOMY
+// ============================================================================
+
+model Category {
+  id       Int  @id @default(autoincrement())
+  parentId Int? @map("parent_id")
+
+  slug   String @unique @db.VarChar(120)
+  nameUz String @map("name_uz") @db.VarChar(150)
+  nameRu String @map("name_ru") @db.VarChar(150)
+  nameEn String @map("name_en") @db.VarChar(150)
+
+  descriptionUz String? @map("description_uz") @db.Text
+  descriptionRu String? @map("description_ru") @db.Text
+  descriptionEn String? @map("description_en") @db.Text
+
+  icon     String? @db.VarChar(60) // lucide icon name
+  colorHex String? @map("color_hex") @db.VarChar(7)
+  imageUrl String? @map("image_url") @db.VarChar(500)
+
+  isActive       Boolean @default(true) @map("is_active")
+  showOnHomepage Boolean @default(false) @map("show_on_homepage")
+  allowBusiness  Boolean @default(true) @map("allow_business_registration")
+  sortOrder      Int     @default(0) @map("sort_order")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  parent     Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children   Category[] @relation("CategoryTree")
+  businesses Business[]
+  products   Product[]
+  events     Event[]
+
+  @@index([parentId, isActive, sortOrder])
+  @@index([isActive, showOnHomepage])
+  @@index([deletedAt])
+  @@map("categories")
+}
+
+// ============================================================================
+// BUSINESS TYPES & CAPABILITIES
+// Capability rows, not hardcoded type branches — this is what lets the
+// inventory/booking/ordering modules attach in Phase 2 with no core migration.
+// ============================================================================
+
+model BusinessType {
+  id     Int    @id @default(autoincrement())
+  slug   String @unique @db.VarChar(80)
+  nameUz String @map("name_uz") @db.VarChar(150)
+  nameRu String @map("name_ru") @db.VarChar(150)
+  nameEn String @map("name_en") @db.VarChar(150)
+
+  // MVP capabilities
+  catalogEnabled     Boolean @default(false) @map("catalog_enabled")
+  eventsEnabled      Boolean @default(true) @map("events_enabled")
+  advertisingEnabled Boolean @default(true) @map("advertising_enabled")
+
+  // Phase 2 — flags exist now, modules built later
+  inventoryEnabled Boolean @default(false) @map("inventory_enabled")
+  warehouseEnabled Boolean @default(false) @map("warehouse_enabled")
+  bookingEnabled   Boolean @default(false) @map("booking_enabled")
+  deliveryEnabled  Boolean @default(false) @map("delivery_enabled")
+  orderingEnabled  Boolean @default(false) @map("ordering_enabled")
+
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  businesses Business[]
+
+  @@index([isActive, sortOrder])
+  @@map("business_types")
+}
+
+// ============================================================================
+// BUSINESS  (canonical brand entity — NO location data lives here)
+// ============================================================================
+
+model Business {
+  id             Int  @id @default(autoincrement())
+  ownerId        Int? @map("owner_id") // null until claimed/approved
+  categoryId     Int  @map("category_id")
+  businessTypeId Int  @map("business_type_id")
+
+  slug        String  @unique @db.VarChar(180) // canonical: /business/:slug
+  name        String  @db.VarChar(200)
+  description String? @db.Text
+  logoUrl     String? @map("logo_url") @db.VarChar(500)
+  coverUrl    String? @map("cover_url") @db.VarChar(500)
+
+  website   String? @db.VarChar(500)
+  email     String? @db.VarChar(255)
+  telegram  String? @db.VarChar(120)
+  instagram String? @db.VarChar(120)
+
+  // SEO overrides (fall back to generated values when null)
+  metaTitleUz       String? @map("meta_title_uz") @db.VarChar(200)
+  metaTitleRu       String? @map("meta_title_ru") @db.VarChar(200)
+  metaTitleEn       String? @map("meta_title_en") @db.VarChar(200)
+  metaDescriptionUz String? @map("meta_description_uz") @db.VarChar(400)
+  metaDescriptionRu String? @map("meta_description_ru") @db.VarChar(400)
+  metaDescriptionEn String? @map("meta_description_en") @db.VarChar(400)
+
+  status          BusinessStatus @default(DRAFT)
+  isVerified      Boolean        @default(false) @map("is_verified")
+  verifiedAt      DateTime?      @map("verified_at")
+  verifiedById    Int?           @map("verified_by_id")
+  rejectionReason String?        @map("rejection_reason") @db.Text
+
+  // MVP promotion flags (real ad module lands in Phase 2 with payments)
+  isPromoted    Boolean   @default(false) @map("is_promoted")
+  promotedUntil DateTime? @map("promoted_until")
+  isFeatured    Boolean   @default(false) @map("is_featured")
+  featuredUntil DateTime? @map("featured_until")
+
+  // Denormalized aggregates across all branches (recalculated on write)
+  ratingAvg     Decimal @default(0) @map("rating_avg") @db.Decimal(3, 2)
+  reviewCount   Int     @default(0) @map("review_count")
+  branchCount   Int     @default(1) @map("branch_count")
+  viewCount     Int     @default(0) @map("view_count")
+  favoriteCount Int     @default(0) @map("favorite_count")
+
+  // NOTE: claimedAt / claimedById REMOVED — claim history now lives in
+  // business_claims. Ownership is expressed solely by ownerId, which is set
+  // when a claim is approved.
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  owner        User?        @relation("BusinessOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  verifiedBy   User?        @relation("BusinessVerifier", fields: [verifiedById], references: [id], onDelete: SetNull)
+  category     Category     @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  businessType BusinessType @relation(fields: [businessTypeId], references: [id], onDelete: Restrict)
+
+  branches       Branch[]
+  products       Product[]
+  events         Event[]
+  favorites      Favorite[]
+  claims         BusinessClaim[]
+  advertisements Advertisement[]
+  analytics      BusinessAnalytics[]
+  healthScore    BusinessHealthScore?
+
+  @@index([ownerId])
+  @@index([categoryId, status])
+  @@index([businessTypeId])
+  @@index([status, deletedAt])
+  @@index([isPromoted, promotedUntil])
+  @@index([isFeatured, featuredUntil])
+  @@index([ratingAvg])
+  @@map("businesses")
+}
+
+// ============================================================================
+// BRANCH  (the geographically-located unit — ALL location queries route here)
+// ============================================================================
+
+model Branch {
+  id         Int  @id @default(autoincrement())
+  businessId Int  @map("business_id")
+  districtId Int  @map("district_id") // required
+  cityId     Int? @map("city_id") // optional, more precise
+
+  name     String  @db.VarChar(200) // e.g. "Asaka filiali"
+  slug     String  @db.VarChar(180)
+  address  String  @db.VarChar(500)
+  landmark String? @db.VarChar(300)
+  phone    String  @db.VarChar(20)
+  phoneAlt String? @map("phone_alt") @db.VarChar(20)
+
+  lat Decimal? @db.Decimal(10, 8)
+  lng Decimal? @db.Decimal(11, 8)
+
+  isPrimary Boolean @default(false) @map("is_primary")
+  isActive  Boolean @default(true) @map("is_active")
+
+  ratingAvg   Decimal @default(0) @map("rating_avg") @db.Decimal(3, 2)
+  reviewCount Int     @default(0) @map("review_count")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  district District @relation(fields: [districtId], references: [id], onDelete: Restrict)
+  city     City?    @relation(fields: [cityId], references: [id], onDelete: SetNull)
+
+  hours   BranchHour[]
+  photos  BranchPhoto[]
+  reviews Review[]
+
+  @@unique([businessId, slug])
+  @@index([businessId, isActive])
+  @@index([districtId, isActive])
+  @@index([cityId, isActive])
+  @@index([lat, lng])
+  @@index([deletedAt])
+  @@map("branches")
+}
+
+model BranchHour {
+  id        Int     @id @default(autoincrement())
+  branchId  Int     @map("branch_id")
+  dayOfWeek Int     @map("day_of_week") // 0 = Monday ... 6 = Sunday
+  openTime  String? @map("open_time") @db.VarChar(5) // "09:00"
+  closeTime String? @map("close_time") @db.VarChar(5) // "21:00"
+  isClosed  Boolean @default(false) @map("is_closed")
+  is24Hours Boolean @default(false) @map("is_24_hours")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, dayOfWeek])
+  @@index([branchId])
+  @@map("branch_hours")
+}
+
+model BranchPhoto {
+  id           Int  @id @default(autoincrement())
+  branchId     Int  @map("branch_id")
+  uploadedById Int? @map("uploaded_by_id")
+
+  url       String  @db.VarChar(500)
+  thumbUrl  String? @map("thumb_url") @db.VarChar(500)
+  publicId  String? @map("public_id") @db.VarChar(255) // Cloudinary
+  caption   String? @db.VarChar(255)
+  isPrimary Boolean @default(false) @map("is_primary")
+  sortOrder Int     @default(0) @map("sort_order")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  branch     Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  uploadedBy User?  @relation("PhotoUploader", fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  @@index([branchId, sortOrder])
+  @@index([branchId, isPrimary])
+  @@map("branch_photos")
+}
+
+// ============================================================================
+// BUSINESS CLAIMS
+// Extracted out of Business. A business may be claimed, rejected, and
+// re-claimed — that history is an entity, not two columns.
+//
+// NOTE: "only one PENDING claim per business" cannot be expressed as a Prisma
+// unique constraint (needs a partial index) — enforce in the service layer.
+// ============================================================================
+
+model BusinessClaim {
+  id         Int @id @default(autoincrement())
+  businessId Int @map("business_id")
+  claimantId Int @map("claimant_id")
+
+  status   ClaimStatus @default(PENDING)
+  evidence String?     @db.Text // owner-supplied proof / notes
+
+  // Contact captured at claim time (may differ from the user's profile)
+  contactPhone String? @map("contact_phone") @db.VarChar(20)
+  contactNote  String? @map("contact_note") @db.Text
+
+  reviewedById    Int?      @map("reviewed_by_id")
+  reviewedAt      DateTime? @map("reviewed_at")
+  rejectionReason String?   @map("rejection_reason") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  claimant   User     @relation("ClaimClaimant", fields: [claimantId], references: [id], onDelete: Cascade)
+  reviewedBy User?    @relation("ClaimReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+
+  @@index([businessId, status])
+  @@index([claimantId])
+  @@index([status, createdAt])
+  @@map("business_claims")
+}
+
+// ============================================================================
+// PRODUCTS / SERVICES  (simple catalog — inventory is Phase 2)
+// Business-scoped: a menu belongs to the brand, not to one address.
+// ============================================================================
+
+model Product {
+  id         Int  @id @default(autoincrement())
+  businessId Int  @map("business_id")
+  categoryId Int? @map("category_id")
+
+  type        ProductType @default(PRODUCT)
+  name        String      @db.VarChar(200)
+  slug        String      @db.VarChar(180)
+  description String?     @db.Text
+  imageUrl    String?     @map("image_url") @db.VarChar(500)
+
+  price    Decimal?    @db.Decimal(14, 2)
+  priceMax Decimal?    @map("price_max") @db.Decimal(14, 2) // for ranges
+  currency String      @default("UZS") @db.VarChar(3)
+  unit     ProductUnit @default(PCS)
+
+  isAvailable Boolean @default(true) @map("is_available")
+  isActive    Boolean @default(true) @map("is_active")
+  sortOrder   Int     @default(0) @map("sort_order")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  category Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  @@unique([businessId, slug])
+  @@index([businessId, isActive, sortOrder])
+  @@index([categoryId])
+  @@index([deletedAt])
+  @@map("products")
+}
+
+// ============================================================================
+// REVIEWS  (branch-scoped — service quality is location-specific)
+// ============================================================================
+
+model Review {
+  id       Int @id @default(autoincrement())
+  branchId Int @map("branch_id")
+  userId   Int @map("user_id")
+
+  rating  Int
+  title   String? @db.VarChar(200)
+  comment String  @db.Text
+
+  status         ReviewStatus @default(PUBLISHED)
+  moderationNote String?      @map("moderation_note") @db.Text
+  helpfulCount   Int          @default(0) @map("helpful_count")
+  reportCount    Int          @default(0) @map("report_count")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  branch  Branch         @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reply   ReviewReply?
+  reports ReviewReport[]
+
+  // One review per user per branch — primary anti-spam control
+  @@unique([branchId, userId])
+  @@index([branchId, status, createdAt])
+  @@index([userId])
+  @@index([status, createdAt])
+  @@map("reviews")
+}
+
+model ReviewReply {
+  id       Int @id @default(autoincrement())
+  reviewId Int @unique @map("review_id") // one reply per review
+  authorId Int @map("author_id") // business owner
+
+  body String @db.Text
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  review Review @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  author User   @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([authorId])
+  @@map("review_replies")
+}
+
+model ReviewReport {
+  id         Int @id @default(autoincrement())
+  reviewId   Int @map("review_id")
+  reporterId Int @map("reporter_id")
+
+  reason ReportReason
+  note   String?      @db.Text
+  status ReportStatus @default(PENDING)
+
+  resolvedById   Int?      @map("resolved_by_id")
+  resolvedAt     DateTime? @map("resolved_at")
+  resolutionNote String?   @map("resolution_note") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  review     Review @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  reporter   User   @relation("ReportReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  resolvedBy User?  @relation("ReportResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+
+  // One report per user per review — prevents report-spam brigading
+  @@unique([reviewId, reporterId])
+  @@index([status, createdAt])
+  @@index([reviewId])
+  @@map("review_reports")
+}
+
+// ============================================================================
+// FAVORITES  (business-scoped — users favorite the brand, not an address)
+// ============================================================================
+
+model Favorite {
+  id         Int      @id @default(autoincrement())
+  userId     Int      @map("user_id")
+  businessId Int      @map("business_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, businessId])
+  @@index([userId, createdAt])
+  @@index([businessId])
+  @@map("favorites")
+}
+
+// ============================================================================
+// EVENTS
+// ============================================================================
+
+model Event {
+  id         Int  @id @default(autoincrement())
+  businessId Int  @map("business_id")
+  districtId Int  @map("district_id")
+  categoryId Int? @map("category_id")
+
+  slug        String    @unique @db.VarChar(180)
+  title       String    @db.VarChar(250)
+  description String    @db.Text
+  type        EventType @default(OTHER)
+  coverUrl    String?   @map("cover_url") @db.VarChar(500)
+
+  startAt  DateTime @map("start_at")
+  endAt    DateTime @map("end_at")
+  timezone String   @default("Asia/Tashkent") @db.VarChar(60)
+
+  venueName String?  @map("venue_name") @db.VarChar(250)
+  address   String?  @db.VarChar(500)
+  lat       Decimal? @db.Decimal(10, 8)
+  lng       Decimal? @db.Decimal(11, 8)
+
+  price           Decimal? @db.Decimal(14, 2)
+  currency        String   @default("UZS") @db.VarChar(3)
+  isFree          Boolean  @default(true) @map("is_free")
+  maxAttendees    Int?     @map("max_attendees")
+  registrationUrl String?  @map("registration_url") @db.VarChar(500)
+  allowRsvp       Boolean  @default(true) @map("allow_rsvp")
+
+  status          EventStatus @default(DRAFT)
+  rejectionReason String?     @map("rejection_reason") @db.Text
+  publishedAt     DateTime?   @map("published_at")
+
+  viewCount     Int @default(0) @map("view_count")
+  attendeeCount Int @default(0) @map("attendee_count")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  business  Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  district  District        @relation(fields: [districtId], references: [id], onDelete: Restrict)
+  category  Category?       @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  attendees EventAttendee[]
+
+  @@index([businessId, status])
+  @@index([districtId, status, startAt])
+  @@index([status, startAt])
+  @@index([deletedAt])
+  @@map("events")
+}
+
+model EventAttendee {
+  id      Int            @id @default(autoincrement())
+  eventId Int            @map("event_id")
+  userId  Int            @map("user_id")
+  status  AttendeeStatus @default(INTERESTED)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, userId])
+  @@index([eventId, status])
+  @@index([userId])
+  @@map("event_attendees")
+}
+
+// ============================================================================
+// ADVERTISEMENTS  —  DEFERRED TO PHASE 2 (ships with Click payments).
+// Table retained so the module attaches without a core migration.
+// MVP promotion is handled by Business.isPromoted / isFeatured.
+// ============================================================================
+
+model Advertisement {
+  id         Int @id @default(autoincrement())
+  businessId Int @map("business_id")
+
+  title       String  @db.VarChar(200)
+  description String? @db.Text
+  imageUrl    String  @map("image_url") @db.VarChar(500)
+  ctaText     String? @map("cta_text") @db.VarChar(80)
+  ctaUrl      String? @map("cta_url") @db.VarChar(500)
+
+  placement AdPlacement
+  status    AdStatus    @default(DRAFT)
+
+  startDate DateTime @map("start_date")
+  endDate   DateTime @map("end_date")
+
+  targetDistrictId Int? @map("target_district_id")
+  targetCategoryId Int? @map("target_category_id")
+
+  priceUzs      Decimal? @map("price_uzs") @db.Decimal(14, 2)
+  paymentStatus String   @default("UNPAID") @map("payment_status") @db.VarChar(20)
+
+  impressions Int @default(0)
+  clicks      Int @default(0)
+
+  approvedById    Int?      @map("approved_by_id")
+  approvedAt      DateTime? @map("approved_at")
+  rejectionReason String?   @map("rejection_reason") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, status])
+  @@index([status, placement, startDate, endDate])
+  @@map("advertisements")
+}
+
+// ============================================================================
+// NOTIFICATIONS  (in-app only for MVP; SMS/Telegram channels are Phase 2)
+// ============================================================================
+
+model Notification {
+  id     Int              @id @default(autoincrement())
+  userId Int              @map("user_id")
+  type   NotificationType
+
+  title String  @db.VarChar(200)
+  body  String  @db.Text
+  link  String? @db.VarChar(500)
+
+  entityType String? @map("entity_type") @db.VarChar(60)
+  entityId   Int?    @map("entity_id")
+
+  isRead Boolean   @default(false) @map("is_read")
+  readAt DateTime? @map("read_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}
+
+// ============================================================================
+// AUDIT LOG  (every sensitive admin action — cheap now, unbackfillable later)
+// ============================================================================
+
+model AuditLog {
+  id      Int         @id @default(autoincrement())
+  actorId Int?        @map("actor_id")
+  action  AuditAction
+
+  entityType String @map("entity_type") @db.VarChar(60)
+  entityId   Int?   @map("entity_id")
+
+  before Json?
+  after  Json?
+  note   String? @db.Text
+
+  ipAddress String? @map("ip_address") @db.VarChar(45)
+  userAgent String? @map("user_agent") @db.VarChar(500)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================================================
+// PLATFORM SETTINGS  (admin-configurable key/value)
+// ============================================================================
+
+model PlatformSetting {
+  id          Int      @id @default(autoincrement())
+  key         String   @unique @db.VarChar(120)
+  value       Json
+  description String?  @db.Text
+  isPublic    Boolean  @default(false) @map("is_public")
+  updatedById Int?     @map("updated_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("platform_settings")
+}
+
+// ============================================================================
+// ANALYTICS
+//
+// BusinessAnalytics is date-grain: one row per business per day. Note the
+// businessId FK is intentionally NOT @unique on its own — only the compound
+// @@unique([businessId, date]) is, since one-row-per-business-EVER would
+// contradict the whole point of a daily table. (An earlier draft had this
+// backwards; fixed here.)
+//
+// searchQueries/visitorCities are plain scalar arrays (Postgres text[] /
+// integer[] — vanilla, no extension), appended to via Prisma's `push`.
+// ============================================================================
+
+model BusinessAnalytics {
+  id         Int      @id @default(autoincrement())
+  businessId Int      @map("business_id")
+  date       DateTime @db.Date
+
+  pageViews       Int @default(0) @map("page_views")
+  callClicks      Int @default(0) @map("call_clicks")
+  directionClicks Int @default(0) @map("direction_clicks")
+  favoriteClicks  Int @default(0) @map("favorite_clicks")
+  shareClicks     Int @default(0) @map("share_clicks")
+  websiteClicks   Int @default(0) @map("website_clicks")
+
+  searchQueries String[] @map("search_queries") // top search terms that led to this business
+  visitorCities Int[]    @map("visitor_cities") // city IDs of visitors (anonymized)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id])
+
+  @@unique([businessId, date])
+  @@index([businessId])
+  @@index([date])
+  @@map("business_analytics")
+}
+
+// DEPRECATED — superseded by SearchAnalytics, which is a strict superset
+// (adds clickCount). Nothing writes here anymore; existing rows were
+// backfilled into search_analytics. Kept only so the migration is
+// non-destructive — safe to drop once you've confirmed the backfill.
+model SearchQueryLog {
+  id          Int      @id @default(autoincrement())
+  query       String
+  businessId  Int?     @map("business_id")
+  categoryId  Int?     @map("category_id")
+  districtId  Int?     @map("district_id")
+  cityId      Int?     @map("city_id")
+  resultCount Int      @map("result_count")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([query])
+  @@index([businessId])
+  @@index([createdAt])
+  @@map("search_query_logs")
+}
+
+// ============================================================================
+// PLATFORM COMMAND CENTER
+//
+// These three tables are deliberately NOT foreign-keyed to Business/Category/
+// District/City/User — they are high-volume, write-heavy append-only logs.
+// Skipping FK constraints avoids a constraint check on every insert and means
+// they never block deleting a business or user. Orphaned references are
+// acceptable (and expected) in anonymized historical logs.
+// ============================================================================
+
+// Pre-aggregated daily rollups so the founder dashboard never scans raw event
+// tables. Populated by POST /admin/analytics/aggregate.
+//
+// NOTE: @@unique([metricType, date]) makes each metric global-per-day, so
+// `metadata` cannot hold per-district/per-category breakdowns as separate
+// rows. It carries supporting detail for the single global figure only.
+model PlatformMetric {
+  id         Int      @id @default(autoincrement())
+  metricType String   @map("metric_type") // DAILY_ACTIVE_USERS, NEW_SIGNUPS, NEW_BUSINESSES, REVIEWS_POSTED, SEARCH_QUERIES, PAGE_VIEWS, REVENUE_ESTIMATE
+  date       DateTime @db.Date
+  value      Int
+  metadata   Json? // { districtId: 1, categoryId: 2, etc. }
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@unique([metricType, date])
+  @@index([metricType, date])
+  @@map("platform_metrics")
+}
+
+// Canonical search log. cityId is carried over from the deprecated
+// SearchQueryLog so switching to this table loses no geographic signal.
+model SearchAnalytics {
+  id          Int      @id @default(autoincrement())
+  query       String
+  resultCount Int      @map("result_count")
+  clickCount  Int      @default(0) @map("click_count")
+  businessId  Int?     @map("business_id") // if they clicked a specific business
+  districtId  Int?     @map("district_id")
+  categoryId  Int?     @map("category_id")
+  cityId      Int?     @map("city_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([query])
+  @@index([createdAt])
+  @@map("search_analytics")
+}
+
+// Raw user-action stream. Distinct from AuditLog: AuditLog records privileged
+// ADMIN actions for accountability, ActivityLog records ordinary (often
+// anonymous) end-user behaviour for product analytics.
+//
+// PRIVACY: metadata stores an ipHash, never a raw IP address.
+model ActivityLog {
+  id         Int      @id @default(autoincrement())
+  actionType String   @map("action_type") // BUSINESS_VIEWED, SEARCH_PERFORMED, CALL_CLICKED, DIRECTION_CLICKED, FAVORITE_ADDED, REVIEW_POSTED, CLAIM_SUBMITTED
+  userId     Int?     @map("user_id")
+  businessId Int?     @map("business_id")
+  metadata   Json? // { ipHash: "abc123", cityId: 1, deviceType: "mobile" }
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([actionType, createdAt])
+  @@index([businessId])
+  @@index([userId])
+  @@map("activity_logs")
+}
+
+// ============================================================================
+// BUSINESS HEALTH SCORE
+//
+// A denormalized scorecard: one row per business, recomputed on write (see
+// HealthScoreService — deliberately NOT a cron job). Both the owner dashboard
+// and the founder health-overview read this single indexed row instead of
+// re-deriving a dozen aggregates per business on every request.
+//
+// The four sub-scores are each 0-100 and independently meaningful; overallScore
+// is a weighted blend of them (weights live in the service, not here, so they
+// can be tuned without a migration).
+// ============================================================================
+
+model BusinessHealthScore {
+  id         Int @id @default(autoincrement())
+  businessId Int @unique @map("business_id")
+
+  overallScore    Int @map("overall_score")
+  profileScore    Int @map("profile_score")
+  engagementScore Int @map("engagement_score")
+  visibilityScore Int @map("visibility_score")
+  responseScore   Int @map("response_score")
+
+  createdAt        DateTime @default(now()) @map("created_at")
+  lastCalculatedAt DateTime @updatedAt @map("last_calculated_at")
+
+  business        Business                 @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  recommendations BusinessRecommendation[]
+
+  // Sorting the platform-wide "who needs help" list is the hot read path.
+  @@index([overallScore])
+  @@map("business_health_scores")
+}
+
+// One actionable instruction for an owner, generated from a specific detected
+// gap. Rows are owned by the recalculation routine: a gap that closes deletes
+// its row, a gap that persists keeps the existing row untouched (which is what
+// preserves the owner's isCompleted flag across recalculations).
+model BusinessRecommendation {
+  id            Int @id @default(autoincrement())
+  healthScoreId Int @map("health_score_id")
+
+  // Stable identifier for the RULE that produced this row (e.g.
+  // "PROFILE_COVER_PHOTO"). Not part of the original spec, but required for
+  // correctness: without a stable key, recalculation cannot distinguish "the
+  // same recommendation as last time" from "a new one", so it would either
+  // duplicate rows on every write or reset isCompleted. Titles are display
+  // copy and will be edited, so they cannot serve as the key.
+  code String @db.VarChar(60)
+
+  type     String @db.VarChar(20) // PROFILE | ENGAGEMENT | VISIBILITY | RESPONSE
+  priority String @db.VarChar(10) // HIGH | MEDIUM | LOW
+
+  titleUz String @map("title_uz") @db.VarChar(200)
+  titleRu String @map("title_ru") @db.VarChar(200)
+  titleEn String @map("title_en") @db.VarChar(200)
+
+  descriptionUz String @map("description_uz") @db.Text
+  descriptionRu String @map("description_ru") @db.Text
+  descriptionEn String @map("description_en") @db.Text
+
+  // Button label. The spec declared actionTextUz only, but its own example
+  // listed all three languages — carried to Ru/En for consistency with every
+  // other user-facing string in this schema.
+  actionTextUz String  @map("action_text_uz") @db.VarChar(120)
+  actionTextRu String  @map("action_text_ru") @db.VarChar(120)
+  actionTextEn String  @map("action_text_en") @db.VarChar(120)
+  actionUrl    String? @map("action_url") @db.VarChar(500) // deep link to the edit page
+
+  // Expected payoff, shown as a nudge ("+40% ko'rishlar"). Localized for the
+  // same reason as actionText. These are directional estimates chosen by the
+  // product, NOT measured lift — there is no experiment framework yet.
+  impactUz String @map("impact_uz") @db.VarChar(120)
+  impactRu String @map("impact_ru") @db.VarChar(120)
+  impactEn String @map("impact_en") @db.VarChar(120)
+
+  isCompleted Boolean   @default(false) @map("is_completed")
+  completedAt DateTime? @map("completed_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  healthScore BusinessHealthScore @relation(fields: [healthScoreId], references: [id], onDelete: Cascade)
+
+  // One row per rule per business — makes recalculation an idempotent upsert.
+  @@unique([healthScoreId, code])
+  @@index([healthScoreId, isCompleted])
+  @@map("business_recommendations")
+}

@@ -1,0 +1,122 @@
+import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { OwnerService } from './owner.service';
+import { CreateMyBusinessDto } from './dto/create-my-business.dto';
+import { UpdateMyBusinessDto } from './dto/update-my-business.dto';
+import { CreateBranchDto } from './dto/create-branch.dto';
+import { UpdateBranchDto } from './dto/update-branch.dto';
+import { UpdateMyEventDto } from './dto/update-my-event.dto';
+import { PaginationQueryDto } from './dto/pagination.dto';
+import { CreateReplyDto } from '../reviews/dto/create-reply.dto';
+import { CreateEventDto } from '../events/dto/create-event.dto';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+
+@ApiTags('owner')
+@ApiBearerAuth()
+@UseGuards(JwtAuthGuard)
+@Controller('me')
+export class OwnerController {
+  constructor(private readonly ownerService: OwnerService) {}
+
+  @Get('stats')
+  getStats(@CurrentUser() user: AuthenticatedUser) {
+    return this.ownerService.getStats(user.id);
+  }
+
+  // ---- Businesses -------------------------------------------------------------
+
+  @Get('businesses')
+  findMyBusinesses(@CurrentUser() user: AuthenticatedUser) {
+    return this.ownerService.findMyBusinesses(user.id);
+  }
+
+  @Post('businesses')
+  createMyBusiness(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateMyBusinessDto) {
+    return this.ownerService.createMyBusiness(user, dto);
+  }
+
+  @Get('businesses/:id')
+  findMyBusinessById(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: AuthenticatedUser) {
+    return this.ownerService.findMyBusinessById(user.id, id);
+  }
+
+  @Patch('businesses/:id')
+  updateMyBusiness(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: UpdateMyBusinessDto,
+  ) {
+    return this.ownerService.updateMyBusiness(user.id, id, dto);
+  }
+
+  @Post('businesses/:id/branches')
+  createBranch(
+    @Param('id', ParseIntPipe) businessId: number,
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: CreateBranchDto,
+  ) {
+    return this.ownerService.createBranch(user.id, businessId, dto);
+  }
+
+  // ---- Branches -----------------------------------------------------------------
+
+  @Patch('branches/:id')
+  updateBranch(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: UpdateBranchDto,
+  ) {
+    return this.ownerService.updateBranch(user.id, id, dto);
+  }
+
+  // ---- Reviews --------------------------------------------------------------------
+
+  @Get('reviews')
+  findMyReviews(@CurrentUser() user: AuthenticatedUser, @Query() query: PaginationQueryDto) {
+    return this.ownerService.findMyReviews(user.id, query);
+  }
+
+  @Post('reviews/:id/reply')
+  replyToReview(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: CreateReplyDto,
+  ) {
+    return this.ownerService.replyToReview(id, user, dto);
+  }
+
+  // ---- Events -----------------------------------------------------------------------
+
+  @Get('events')
+  findMyEvents(@CurrentUser() user: AuthenticatedUser, @Query() query: PaginationQueryDto) {
+    return this.ownerService.findMyEvents(user.id, query);
+  }
+
+  @Post('events')
+  createMyEvent(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateEventDto) {
+    return this.ownerService.createMyEvent(user, dto);
+  }
+
+  @Patch('events/:id')
+  updateMyEvent(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: UpdateMyEventDto,
+  ) {
+    return this.ownerService.updateMyEvent(user.id, id, dto);
+  }
+
+  @Delete('events/:id')
+  removeMyEvent(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: AuthenticatedUser) {
+    return this.ownerService.removeMyEvent(user.id, id);
+  }
+
+  // ---- Claims -------------------------------------------------------------------------
+
+  @Get('claims')
+  findMyClaims(@CurrentUser() user: AuthenticatedUser, @Query() query: PaginationQueryDto) {
+    return this.ownerService.findMyClaims(user.id, query);
+  }
+}
