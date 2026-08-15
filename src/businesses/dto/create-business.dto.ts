@@ -113,9 +113,12 @@ export class CreateBusinessDto {
   @MaxLength(500)
   website?: string;
 
+  // Named `hours`, not `workingHours` — matches the field name the API's own
+  // read responses already use for a branch's hours (branches[].hours), and
+  // what the frontend actually sends.
   @IsOptional()
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => WorkingHourInputDto)
-  workingHours?: WorkingHourInputDto[];
+  hours?: WorkingHourInputDto[];
 }

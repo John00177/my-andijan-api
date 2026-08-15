@@ -92,9 +92,9 @@ export class BusinessesService {
       isPrimary: true,
     });
 
-    if (dto.workingHours?.length) {
+    if (dto.hours?.length) {
       await this.ownerService.updateBranch(user.id, branch.id, {
-        hours: dto.workingHours.map((hour) => ({
+        hours: dto.hours.map((hour) => ({
           dayOfWeek: hour.day,
           openTime: hour.openTime ?? undefined,
           closeTime: hour.closeTime ?? undefined,
