@@ -4,6 +4,8 @@ import { PassportModule } from '@nestjs/passport';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtStrategy } from './strategies/jwt.strategy';
+import { SmsService } from '../sms/sms.service';
+import { UploadService } from '../upload/upload.service';
 
 @Module({
   imports: [
@@ -14,7 +16,10 @@ import { JwtStrategy } from './strategies/jwt.strategy';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, JwtStrategy],
+  // UploadService is provided directly rather than by importing UploadModule:
+  // that module also registers UploadController, and importing it here would
+  // mount /upload a second time.
+  providers: [AuthService, JwtStrategy, SmsService, UploadService],
   exports: [AuthService],
 })
 export class AuthModule {}

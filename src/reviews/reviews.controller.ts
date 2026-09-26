@@ -57,4 +57,20 @@ export class ReviewsController {
   ) {
     return this.reviewsService.reply(id, user, dto);
   }
+
+  // PATCH alias of the route above — "reply" reads more like updating the
+  // review resource's reply than creating a new one, and callers may expect
+  // either verb. Both hit the same ownership-checked service method; POST is
+  // kept so nothing already using it breaks.
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.BUSINESS_OWNER)
+  @Patch(':id/reply')
+  replyPatch(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: CreateReplyDto,
+  ) {
+    return this.reviewsService.reply(id, user, dto);
+  }
 }

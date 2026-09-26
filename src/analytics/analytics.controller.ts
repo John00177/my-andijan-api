@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { UserRole } from '@prisma/client';
 import { AnalyticsService } from './analytics.service';
 import { RecordViewDto } from './dto/record-view.dto';
 import { RecordClickDto } from './dto/record-click.dto';
@@ -7,6 +8,8 @@ import { RecordSearchDto } from './dto/record-search.dto';
 import { AnalyticsScopeQueryDto } from './dto/analytics-scope-query.dto';
 import { TrafficQueryDto } from './dto/traffic-query.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 
@@ -74,5 +77,23 @@ export class AnalyticsController {
   @Get('me/analytics/competitors')
   getCompetitors(@CurrentUser() user: AuthenticatedUser, @Query() query: AnalyticsScopeQueryDto) {
     return this.analyticsService.getCompetitors(user.id, query.businessId);
+  }
+
+  // ---- Platform-wide user analytics (SUPER_ADMIN only) ---------------------------
+
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN)
+  @Get('admin/analytics/users')
+  getUserAnalytics() {
+    return this.analyticsService.getUserAnalytics();
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN)
+  @Get('admin/analytics/dashboard')
+  getDashboardAnalytics() {
+    return this.analyticsService.getDashboardAnalytics();
   }
 }

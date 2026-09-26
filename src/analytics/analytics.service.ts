@@ -418,6 +418,119 @@ export class AnalyticsService {
     };
   }
 
+  // ============================================================================
+  // PLATFORM-WIDE USER ANALYTICS (SUPER_ADMIN only)
+  // ============================================================================
+
+  async getUserAnalytics() {
+    const [totalUsers, ageGroups, genderSplitRaw, cityBreakdown] = await Promise.all([
+      this.prisma.user.count({ where: { deletedAt: null } }),
+
+      // Table/column names are the mapped ones (`users`, not the Prisma model
+      // name `User`) — @@map on the model means the real Postgres relation is
+      // lowercase. COUNT(*) is cast to ::int because Prisma returns raw bigint
+      // aggregates as native JS BigInt, which Nest's JSON serializer can't
+      // stringify.
+      this.prisma.$queryRaw<{ range: string; count: number }[]>`
+        SELECT
+          CASE
+            WHEN age BETWEEN 16 AND 25 THEN '16-25'
+            WHEN age BETWEEN 26 AND 35 THEN '26-35'
+            WHEN age BETWEEN 36 AND 60 THEN '36-60'
+            WHEN age > 60 THEN '60+'
+            ELSE 'Noma''lum'
+          END as range,
+          COUNT(*)::int as count
+        FROM users
+        WHERE deleted_at IS NULL
+        GROUP BY range
+        ORDER BY count DESC
+      `,
+
+      this.prisma.user.groupBy({
+        by: ['gender'],
+        _count: { id: true },
+        where: { gender: { not: null }, deletedAt: null },
+      }),
+
+      // districtId is a foreign key to District, not Region (this platform
+      // has exactly one Region — "Andijon viloyati" — so joining Region here
+      // would bucket every single user into that one row). District is also
+      // what the codebase already treats as the user-facing "city" concept
+      // (see RegisterDto.districtId, User.district relation).
+      this.prisma.$queryRaw<{ city: string; count: number }[]>`
+        SELECT COALESCE(d.name_uz, 'Noma''lum') as city, COUNT(u.id)::int as count
+        FROM users u
+        LEFT JOIN districts d ON u.district_id = d.id
+        WHERE u.deleted_at IS NULL
+        GROUP BY d.name_uz
+        ORDER BY count DESC
+        LIMIT 20
+      `,
+    ]);
+
+    const genderSplit = genderSplitRaw.map((row) => ({ gender: row.gender, count: row._count.id }));
+
+    return { totalUsers, ageGroups, genderSplit, cityBreakdown };
+  }
+
+  // ============================================================================
+  // PLATFORM DASHBOARD ANALYTICS (SUPER_ADMIN only)
+  //
+  // A separate endpoint/method rather than extending getUserAnalytics() in
+  // place — the frontend's AnalyticsView already reads GET /admin/analytics/users
+  // as a flat { totalUsers, ageGroups, genderSplit, cityBreakdown } object;
+  // nesting it under a `users` key would be a breaking change to a route
+  // that's already live.
+  // ============================================================================
+
+  async getDashboardAnalytics() {
+    const startOfMonth = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1));
+
+    const [userAnalytics, usersNewThisMonth, totalBusinesses, byStatusRaw, byCategory, businessesNewThisMonth] =
+      await Promise.all([
+        this.getUserAnalytics(),
+
+        this.prisma.user.count({ where: { deletedAt: null, createdAt: { gte: startOfMonth } } }),
+
+        this.prisma.business.count({ where: { deletedAt: null } }),
+
+        this.prisma.business.groupBy({
+          by: ['status'],
+          _count: { id: true },
+          where: { deletedAt: null },
+        }),
+
+        // Real status values are DRAFT/PENDING/APPROVED/REJECTED/SUSPENDED/HIDDEN
+        // (see BusinessStatus in schema.prisma) — there is no "ACTIVE" status on
+        // this platform; APPROVED is the live-and-visible state.
+        this.prisma.$queryRaw<{ category: string; count: number }[]>`
+          SELECT COALESCE(c.name_uz, 'Noma''lum') as category, COUNT(b.id)::int as count
+          FROM businesses b
+          LEFT JOIN categories c ON b.category_id = c.id
+          WHERE b.deleted_at IS NULL
+          GROUP BY c.name_uz
+          ORDER BY count DESC
+        `,
+
+        this.prisma.business.count({
+          where: { deletedAt: null, createdAt: { gte: startOfMonth } },
+        }),
+      ]);
+
+    const byStatus = byStatusRaw.map((row) => ({ status: row.status, count: row._count.id }));
+
+    return {
+      users: { ...userAnalytics, newThisMonth: usersNewThisMonth },
+      businesses: {
+        totalBusinesses,
+        byStatus,
+        byCategory,
+        newThisMonth: businessesNewThisMonth,
+      },
+    };
+  }
+
   private compareMetric(current: number, previous: number) {
     return { current, previous, change: formatPercentChange(current, previous) };
   }

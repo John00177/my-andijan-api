@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { AuditAction, BusinessStatus, ClaimStatus, EventStatus, Prisma, ReviewStatus, UserRole } from '@prisma/client';
+import { BusinessStatus, ClaimStatus, EventStatus, Prisma, ReviewStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReviewsService } from '../reviews/reviews.service';
 import { EventsService } from '../events/events.service';
@@ -180,23 +180,11 @@ export class OwnerService {
         },
       });
 
-      // Creating a business is the other path (besides claim-approval) to
-      // becoming a BUSINESS_OWNER — a plain CUSTOMER shouldn't need an admin
-      // in the loop just to list their first business.
-      if (user.role === UserRole.CUSTOMER) {
-        await tx.user.update({ where: { id: user.id }, data: { role: UserRole.BUSINESS_OWNER } });
-        await tx.auditLog.create({
-          data: {
-            actorId: user.id,
-            action: AuditAction.ROLE_CHANGE,
-            entityType: 'User',
-            entityId: user.id,
-            before: { role: UserRole.CUSTOMER },
-            after: { role: UserRole.BUSINESS_OWNER },
-            note: 'Auto-promoted on first business creation',
-          },
-        });
-      }
+      // NOTE: CUSTOMER -> BUSINESS_OWNER promotion does NOT happen here
+      // anymore. A submitted business is only PENDING review — the
+      // submitter's role stays whatever it was until an admin/moderator
+      // approves the listing (see AdminService.approveBusiness), so a
+      // rejected submission never left a stray role change behind.
 
       return business;
     });
@@ -204,6 +192,12 @@ export class OwnerService {
 
   async updateMyBusiness(userId: number, id: number, dto: UpdateMyBusinessDto) {
     await this.getOwnedBusiness(userId, id);
+
+    if (dto.categoryId != null) {
+      const category = await this.prisma.category.findFirst({ where: { id: dto.categoryId, deletedAt: null } });
+      if (!category) throw new NotFoundException(`Category ${dto.categoryId} not found`);
+    }
+
     const updated = await this.prisma.business.update({ where: { id }, data: { ...dto } });
 
     // Editing description/telegram/instagram/cover directly moves profileScore,
@@ -303,6 +297,11 @@ export class OwnerService {
       throw new NotFoundException(`Branch ${branchId} not found`);
     }
 
+    if (dto.districtId != null) {
+      const district = await this.prisma.district.findUnique({ where: { id: dto.districtId } });
+      if (!district) throw new NotFoundException(`District ${dto.districtId} not found`);
+    }
+
     const updated = await this.prisma.$transaction(async (tx) => {
       if (dto.isPrimary) {
         await tx.branch.updateMany({
@@ -319,6 +318,7 @@ export class OwnerService {
           phone: dto.phone,
           phoneAlt: dto.phoneAlt,
           isPrimary: dto.isPrimary,
+          districtId: dto.districtId,
         },
       });
 

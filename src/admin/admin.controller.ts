@@ -19,6 +19,8 @@ import {
   PromoteBusinessDto,
   RejectBusinessDto,
   SuspendBusinessDto,
+  UpdateBusinessBranchDto,
+  UpdateBusinessDto,
 } from './dto/business.dto';
 import { ListClaimsAdminQueryDto, RejectClaimDto } from './dto/claim.dto';
 import { ListReportsQueryDto, ResolveReportDto } from './dto/report.dto';
@@ -55,11 +57,16 @@ export class AdminController {
     return this.adminService.findBusinesses(query);
   }
 
+  // Overrides the class-level @Roles(ADMIN) floor down to MODERATOR for
+  // these two actions specifically — moderation is exactly what MODERATOR
+  // exists for.
+  @Roles(UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
   @Post('businesses/:id/approve')
   approveBusiness(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
     return this.adminService.approveBusiness(id, admin.id);
   }
 
+  @Roles(UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
   @Post('businesses/:id/reject')
   rejectBusiness(
     @Param('id', ParseIntPipe) id: number,
@@ -67,6 +74,33 @@ export class AdminController {
     @Body() dto: RejectBusinessDto,
   ) {
     return this.adminService.rejectBusiness(id, admin.id, dto);
+  }
+
+  // SUPER_ADMIN only — pulls a live listing out of search/detail pages
+  // without deleting it. Distinct from /suspend (ADMIN-level, reversible
+  // moderation action already above) in who's allowed to pull the trigger.
+  @Roles(UserRole.SUPER_ADMIN)
+  @Patch('businesses/:id/hide')
+  hideBusiness(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
+    return this.adminService.hideBusiness(id, admin.id);
+  }
+
+  @Patch('businesses/:id')
+  updateBusiness(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() admin: AuthenticatedUser,
+    @Body() dto: UpdateBusinessDto,
+  ) {
+    return this.adminService.updateBusiness(id, admin.id, dto);
+  }
+
+  @Patch('businesses/:id/branch')
+  updateBusinessBranch(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() admin: AuthenticatedUser,
+    @Body() dto: UpdateBusinessBranchDto,
+  ) {
+    return this.adminService.updateBusinessBranch(id, admin.id, dto);
   }
 
   @Post('businesses/:id/verify')

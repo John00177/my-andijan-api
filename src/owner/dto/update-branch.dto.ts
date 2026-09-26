@@ -34,6 +34,11 @@ export class UpdateBranchDto {
   address?: string;
 
   @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  districtId?: number;
+
+  @IsOptional()
   @IsString()
   @MaxLength(300)
   landmark?: string;

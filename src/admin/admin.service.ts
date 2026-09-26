@@ -24,6 +24,8 @@ import {
   PromoteBusinessDto,
   RejectBusinessDto,
   SuspendBusinessDto,
+  UpdateBusinessBranchDto,
+  UpdateBusinessDto,
 } from './dto/business.dto';
 import { ListClaimsAdminQueryDto, RejectClaimDto } from './dto/claim.dto';
 import { ListReportsQueryDto, ReportResolveAction, ResolveReportDto } from './dto/report.dto';
@@ -138,7 +140,12 @@ export class AdminService {
             where: { deletedAt: null },
             orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
             take: 1,
-            select: { id: true, address: true, district: { select: { id: true, slug: true, nameUz: true } } },
+            select: {
+              id: true,
+              address: true,
+              phone: true,
+              district: { select: { id: true, slug: true, nameUz: true } },
+            },
           },
         },
       }),
@@ -173,6 +180,24 @@ export class AdminService {
       );
 
       if (business.ownerId) {
+        // CUSTOMER -> BUSINESS_OWNER happens HERE, not at submission time —
+        // a CUSTOMER stays a CUSTOMER while their listing is only PENDING.
+        // (Moved from OwnerService.createMyBusiness, which used to promote
+        // immediately on submit.)
+        const owner = await tx.user.findUnique({ where: { id: business.ownerId } });
+        if (owner && owner.role === UserRole.CUSTOMER) {
+          await tx.user.update({ where: { id: owner.id }, data: { role: UserRole.BUSINESS_OWNER } });
+          await this.writeAudit(
+            tx,
+            adminId,
+            AuditAction.ROLE_CHANGE,
+            'User',
+            owner.id,
+            { role: UserRole.CUSTOMER },
+            { role: UserRole.BUSINESS_OWNER },
+          );
+        }
+
         await tx.notification.create({
           data: {
             userId: business.ownerId,
@@ -184,6 +209,103 @@ export class AdminService {
           },
         });
       }
+
+      return updated;
+    });
+  }
+
+  // Core-field editing (name/description/category) — deliberately separate
+  // from every status-transition method above, which each carry their own
+  // side effects. This one is a plain field patch.
+  async updateBusiness(id: number, adminId: number, dto: UpdateBusinessDto) {
+    return this.prisma.$transaction(async (tx) => {
+      const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
+      if (!business) throw new NotFoundException(`Business ${id} not found`);
+
+      if (dto.categoryId != null) {
+        const category = await tx.category.findFirst({ where: { id: dto.categoryId, deletedAt: null } });
+        if (!category) throw new NotFoundException(`Category ${dto.categoryId} not found`);
+      }
+
+      const updated = await tx.business.update({
+        where: { id },
+        data: { name: dto.name, description: dto.description, categoryId: dto.categoryId },
+        include: { category: { select: { id: true, slug: true, nameUz: true } } },
+      });
+
+      await this.writeAudit(
+        tx,
+        adminId,
+        AuditAction.UPDATE,
+        'Business',
+        id,
+        { name: business.name, description: business.description, categoryId: business.categoryId },
+        { name: updated.name, description: updated.description, categoryId: updated.categoryId },
+      );
+
+      return updated;
+    });
+  }
+
+  async updateBusinessBranch(id: number, adminId: number, dto: UpdateBusinessBranchDto) {
+    return this.prisma.$transaction(async (tx) => {
+      const branch = await tx.branch.findFirst({
+        where: { businessId: id, deletedAt: null },
+        orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+      });
+      if (!branch) throw new NotFoundException(`Business ${id} has no branch to edit`);
+
+      if (dto.districtId != null) {
+        const district = await tx.district.findUnique({ where: { id: dto.districtId } });
+        if (!district) throw new NotFoundException(`District ${dto.districtId} not found`);
+      }
+
+      const updated = await tx.branch.update({
+        where: { id: branch.id },
+        data: { phone: dto.phone, address: dto.address, districtId: dto.districtId },
+        include: { district: { select: { id: true, slug: true, nameUz: true } } },
+      });
+
+      await this.writeAudit(
+        tx,
+        adminId,
+        AuditAction.UPDATE,
+        'Branch',
+        branch.id,
+        { phone: branch.phone, address: branch.address, districtId: branch.districtId },
+        { phone: updated.phone, address: updated.address, districtId: updated.districtId },
+      );
+
+      return updated;
+    });
+  }
+
+  // SUPER_ADMIN-only visibility kill-switch — distinct status from SUSPENDED
+  // so an admin's routine "temporarily suspend for a fixable issue" and a
+  // SUPER_ADMIN's "pull this off the platform" don't collapse into the same
+  // state with different access rules attached to it.
+  async hideBusiness(id: number, adminId: number) {
+    return this.prisma.$transaction(async (tx) => {
+      const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
+      if (!business) throw new NotFoundException(`Business ${id} not found`);
+      if (business.status === BusinessStatus.HIDDEN) {
+        throw new ConflictException(`Business ${id} is already hidden`);
+      }
+
+      const updated = await tx.business.update({
+        where: { id },
+        data: { status: BusinessStatus.HIDDEN },
+      });
+
+      await this.writeAudit(
+        tx,
+        adminId,
+        AuditAction.UPDATE,
+        'Business',
+        id,
+        { status: business.status },
+        { status: updated.status },
+      );
 
       return updated;
     });

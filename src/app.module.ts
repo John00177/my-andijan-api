@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
+import { UsersModule } from './users/users.module';
 import { GeographyModule } from './geography/geography.module';
 import { CategoriesModule } from './categories/categories.module';
 import { BusinessesModule } from './businesses/businesses.module';
@@ -13,11 +14,14 @@ import { OwnerModule } from './owner/owner.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { CommandCenterModule } from './command-center/command-center.module';
 import { HealthScoreModule } from './health-score/health-score.module';
+import { ProductsModule } from './products/products.module';
+import { UploadModule } from './upload/upload.module';
 
 @Module({
   imports: [
     PrismaModule,
     AuthModule,
+    UsersModule,
     GeographyModule,
     CategoriesModule,
     BusinessesModule,
@@ -30,6 +34,8 @@ import { HealthScoreModule } from './health-score/health-score.module';
     AnalyticsModule,
     CommandCenterModule,
     HealthScoreModule,
+    ProductsModule,
+    UploadModule,
   ],
 })
 export class AppModule {}

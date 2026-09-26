@@ -23,7 +23,10 @@ datasource db {
 enum UserRole {
   CUSTOMER
   BUSINESS_OWNER
+  MODERATOR
+  SUPPORT
   ADMIN
+  SUPER_ADMIN
 }
 
 enum UserStatus {
@@ -38,6 +41,11 @@ enum Language {
   EN
 }
 
+enum Gender {
+  MALE
+  FEMALE
+}
+
 enum OtpPurpose {
   PHONE_VERIFY
   PASSWORD_RESET
@@ -50,6 +58,7 @@ enum BusinessStatus {
   APPROVED
   REJECTED
   SUSPENDED
+  HIDDEN
 }
 
 enum ClaimStatus {
@@ -202,6 +211,11 @@ model User {
   // before the user ever creates or claims a business. SetNull on delete: a
   // district being retired shouldn't cascade into deleting user accounts.
   districtId Int? @map("district_id")
+
+  // Profile-completion fields (PATCH /users/me, 2026-08-15).
+  age      Int?
+  gender   Gender?
+  avatarId String? @map("avatar_id") @db.VarChar(40)
 
   lastLoginAt DateTime? @map("last_login_at")
   createdAt   DateTime  @default(now()) @map("created_at")
@@ -439,6 +453,11 @@ model Business {
   description String? @db.Text
   logoUrl     String? @map("logo_url") @db.VarChar(500)
   coverUrl    String? @map("cover_url") @db.VarChar(500)
+  coverPhoto  String? @map("cover_photo") @db.VarChar(500)
+
+  hasDelivery  Boolean @default(false) @map("has_delivery")
+  deliveryFee  Int?    @map("delivery_fee")
+  deliveryTime String? @map("delivery_time") @db.VarChar(60)
 
   website   String? @db.VarChar(500)
   email     String? @db.VarChar(255)
@@ -681,6 +700,7 @@ model Review {
   rating  Int
   title   String? @db.VarChar(200)
   comment String  @db.Text
+  photos  String[] @default([])
 
   status         ReviewStatus @default(PUBLISHED)
   moderationNote String?      @map("moderation_note") @db.Text

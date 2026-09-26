@@ -1,11 +1,10 @@
 import { Type } from 'class-transformer';
-import { IsEmail, IsInt, IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsBoolean, IsEmail, IsInt, IsOptional, IsString, MaxLength, Min } from 'class-validator';
 
-// The spec lists "phone" as an editable business field, but Business has no
-// phone column — phone lives on Branch (a business can have several
-// branches, each with its own number). Omitted here rather than guessed at;
-// branch phone is editable via PATCH /me/branches/:id.
-export class UpdateMyBusinessDto {
+// Used by PATCH /businesses/:id — owner or ADMIN/MODERATOR/SUPER_ADMIN only
+// (see BusinessesService.assertCanManage). All fields optional so callers
+// can send a partial patch.
+export class UpdateBusinessDto {
   @IsOptional()
   @IsString()
   @MaxLength(200)
@@ -19,6 +18,36 @@ export class UpdateMyBusinessDto {
   @Type(() => Number)
   @IsInt()
   categoryId?: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  logoUrl?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  coverUrl?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  coverPhoto?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  hasDelivery?: boolean;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  deliveryFee?: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  deliveryTime?: string;
 
   @IsOptional()
   @IsString()

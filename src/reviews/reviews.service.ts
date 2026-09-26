@@ -1,9 +1,11 @@
 import { ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, ReviewStatus } from '@prisma/client';
+import { Prisma, ReviewStatus, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { ROLE_HIERARCHY } from '../common/constants/role-hierarchy';
 import { HealthScoreService } from '../health-score/health-score.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { CreateReviewDto } from './dto/create-review.dto';
+import { CreateBusinessReviewDto } from './dto/create-business-review.dto';
 import { UpdateReviewDto } from './dto/update-review.dto';
 import { CreateReplyDto } from './dto/create-reply.dto';
 
@@ -35,6 +37,7 @@ export class ReviewsService {
           rating: dto.rating,
           title: dto.title,
           comment: dto.comment,
+          photos: dto.photos ?? [],
         },
         include: REVIEW_INCLUDE,
       });
@@ -47,6 +50,44 @@ export class ReviewsService {
       }
       throw error;
     }
+  }
+
+  // ============================================================================
+  // BUSINESS-SCOPED CONVENIENCE (GET/POST /businesses/:id/reviews)
+  //
+  // Reviews are branch-scoped in storage (service quality is location-
+  // specific — see the schema notes on Branch), but a business with one
+  // branch is the common case and a caller shouldn't have to know a branch
+  // id just to read or leave a review "for the business". GET flattens
+  // across every branch (same query BusinessesService.findOne already runs
+  // for the public detail page); POST targets the primary branch, the same
+  // "business-level write resolves to primary branch" pattern PUT
+  // /businesses/:id/hours uses for BranchHour.
+  // ============================================================================
+
+  async findForBusiness(businessId: number) {
+    const business = await this.prisma.business.findFirst({ where: { id: businessId, deletedAt: null } });
+    if (!business) {
+      throw new NotFoundException(`Business ${businessId} not found`);
+    }
+
+    return this.prisma.review.findMany({
+      where: { status: ReviewStatus.PUBLISHED, deletedAt: null, branch: { businessId } },
+      orderBy: { createdAt: 'desc' },
+      include: REVIEW_INCLUDE,
+    });
+  }
+
+  async createForBusiness(userId: number, businessId: number, dto: CreateBusinessReviewDto) {
+    const primaryBranch = await this.prisma.branch.findFirst({
+      where: { businessId, deletedAt: null, isActive: true },
+      orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+    });
+    if (!primaryBranch) {
+      throw new NotFoundException(`Business ${businessId} has no branch to review`);
+    }
+
+    return this.create(userId, { branchId: primaryBranch.id, ...dto });
   }
 
   async findOne(id: number) {
@@ -97,7 +138,12 @@ export class ReviewsService {
       throw new NotFoundException(`Review ${id} not found`);
     }
 
-    if (review.branch.business.ownerId !== user.id) {
+    // Owner or ADMIN/MODERATOR/SUPER_ADMIN — the route's @Roles(BUSINESS_OWNER)
+    // guard already lets staff through via the hierarchy check, but this was
+    // still hard-blocking everyone except the literal owner underneath it.
+    const isOwner = review.branch.business.ownerId === user.id;
+    const isStaff = ROLE_HIERARCHY[user.role] >= ROLE_HIERARCHY[UserRole.MODERATOR];
+    if (!isOwner && !isStaff) {
       throw new ForbiddenException('Only the owner of this business can reply to this review');
     }
 

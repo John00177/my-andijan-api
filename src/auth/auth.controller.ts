@@ -1,6 +1,24 @@
-import { Body, Controller, HttpCode, HttpStatus, Post, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  HttpCode,
+  HttpStatus,
+  Post,
+  Put,
+  UploadedFile,
+  UseGuards,
+  UseInterceptors,
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
+import { RequestOtpDto } from './dto/request-otp.dto';
+import { VerifyOtpDto } from './dto/verify-otp.dto';
+import { UpdateProfileDto } from './dto/update-profile.dto';
+
+const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
+
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshDto } from './dto/refresh.dto';
@@ -39,6 +57,43 @@ export class AuthController {
   @Post('logout')
   logout(@Body() dto: RefreshDto, @CurrentUser() _user: AuthenticatedUser) {
     return this.authService.logout(dto.refreshToken);
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('otp/request')
+  requestOtp(@Body() dto: RequestOtpDto) {
+    return this.authService.requestOtp(dto);
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('otp/verify')
+  verifyOtp(@Body() dto: VerifyOtpDto) {
+    return this.authService.verifyOtp(dto);
+  }
+
+  @ApiBearerAuth()
+  @ApiConsumes('multipart/form-data')
+  @UseGuards(JwtAuthGuard)
+  @Put('profile')
+  @UseInterceptors(
+    FileInterceptor('photo', {
+      limits: { fileSize: MAX_PHOTO_BYTES },
+      fileFilter: (_req, file, cb) => {
+        // Rejecting here keeps a non-image from ever reaching storage. The
+        // multipart parser still caps size independently via `limits`.
+        if (!file.mimetype?.startsWith('image/')) {
+          return cb(new BadRequestException('Only image files are accepted'), false);
+        }
+        cb(null, true);
+      },
+    }),
+  )
+  updateProfile(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: UpdateProfileDto,
+    @UploadedFile() photo?: Express.Multer.File,
+  ) {
+    return this.authService.updateProfile(user.id, dto, photo);
   }
 
   @HttpCode(HttpStatus.OK)

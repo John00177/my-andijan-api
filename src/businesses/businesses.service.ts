@@ -1,10 +1,13 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
-import { BusinessStatus, EventStatus, Prisma, ReviewStatus } from '@prisma/client';
+import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { AuditAction, BusinessStatus, EventStatus, Prisma, ReviewStatus, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { OwnerService } from '../owner/owner.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+import { ROLE_HIERARCHY } from '../common/constants/role-hierarchy';
 import { ListBusinessesQueryDto } from './dto/list-businesses-query.dto';
 import { CreateBusinessDto } from './dto/create-business.dto';
+import { UpdateBusinessDto } from './dto/update-business.dto';
+import { BusinessHourInputDto } from './dto/update-business-hours.dto';
 
 // Shared shape for every list-style endpoint (list/featured/promoted): the
 // primary branch is resolved server-side so clients never have to reason
@@ -181,9 +184,19 @@ export class BusinessesService {
     return businesses.map((b) => this.toListItem(b));
   }
 
-  async findBySlug(slug: string) {
+  // Accepts either a numeric id or a slug — GET /businesses/:slug and GET
+  // /businesses/:id can't be registered as two separate routes on the same
+  // path shape, so one handler serves both lookups.
+  async findOne(idOrSlug: string) {
+    const asId = Number(idOrSlug);
+    const isId = Number.isInteger(asId) && String(asId) === idOrSlug;
+
     const business = await this.prisma.business.findFirst({
-      where: { slug, status: BusinessStatus.APPROVED, deletedAt: null },
+      where: {
+        ...(isId ? { id: asId } : { slug: idOrSlug }),
+        status: BusinessStatus.APPROVED,
+        deletedAt: null,
+      },
       include: {
         category: true,
         businessType: true,
@@ -209,7 +222,7 @@ export class BusinessesService {
     });
 
     if (!business) {
-      throw new NotFoundException(`Business "${slug}" not found`);
+      throw new NotFoundException(`Business "${idOrSlug}" not found`);
     }
 
     // Reviews live on Branch, not Business (service quality is
@@ -235,6 +248,119 @@ export class BusinessesService {
       events: business.businessType.eventsEnabled ? business.events : [],
       reviews,
     };
+  }
+
+  // ============================================================================
+  // UPDATE  (PATCH /businesses/:id)
+  //
+  // Distinct from OwnerService.updateMyBusiness: that path is owner-only via
+  // /me/businesses/:id, this one is the general-purpose endpoint reachable by
+  // moderation staff too, so ownership is checked here rather than baked
+  // into a userId-scoped query.
+  // ============================================================================
+
+  async update(id: number, user: AuthenticatedUser, dto: UpdateBusinessDto) {
+    const business = await this.getBusinessOrThrow(id);
+    this.assertCanManage(business, user);
+
+    if (dto.categoryId != null) {
+      const category = await this.prisma.category.findFirst({ where: { id: dto.categoryId, deletedAt: null } });
+      if (!category) throw new NotFoundException(`Category ${dto.categoryId} not found`);
+    }
+
+    return this.prisma.business.update({ where: { id }, data: { ...dto } });
+  }
+
+  // ============================================================================
+  // HOURS  (PUT /businesses/:id/hours)
+  //
+  // Hours live on Branch, not Business (see schema notes on Business/Branch
+  // split) — this replaces the primary branch's hours, since that's the
+  // single set of hours the business detail page shows.
+  // ============================================================================
+
+  async updateHours(id: number, user: AuthenticatedUser, hours: BusinessHourInputDto[]) {
+    const business = await this.getBusinessOrThrow(id);
+    this.assertCanManage(business, user);
+
+    const primaryBranch = await this.prisma.branch.findFirst({
+      where: { businessId: id, deletedAt: null },
+      orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+    });
+    if (!primaryBranch) {
+      throw new NotFoundException(`Business ${id} has no branch to attach hours to`);
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.branchHour.deleteMany({ where: { branchId: primaryBranch.id } });
+
+      if (hours.length) {
+        await tx.branchHour.createMany({
+          data: hours.map((hour) => ({
+            branchId: primaryBranch.id,
+            dayOfWeek: hour.dayOfWeek,
+            openTime: hour.openTime,
+            closeTime: hour.closeTime,
+            isClosed: hour.isClosed ?? false,
+            is24Hours: hour.is24Hours ?? false,
+          })),
+        });
+      }
+
+      return tx.branchHour.findMany({
+        where: { branchId: primaryBranch.id },
+        orderBy: { dayOfWeek: 'asc' },
+      });
+    });
+  }
+
+  private async getBusinessOrThrow(id: number) {
+    const business = await this.prisma.business.findFirst({ where: { id, deletedAt: null } });
+    if (!business) {
+      throw new NotFoundException(`Business ${id} not found`);
+    }
+    return business;
+  }
+
+  // Owner or ADMIN/MODERATOR/SUPER_ADMIN — RolesGuard alone can't express
+  // "owner OR role >= X", so the ownership half is checked here.
+  private assertCanManage(business: { ownerId: number | null }, user: AuthenticatedUser) {
+    const isOwner = business.ownerId === user.id;
+    const isStaff = ROLE_HIERARCHY[user.role] >= ROLE_HIERARCHY[UserRole.MODERATOR];
+    if (!isOwner && !isStaff) {
+      throw new ForbiddenException('You do not have permission to manage this business');
+    }
+  }
+
+  // Soft delete, consistent with every other entity in this schema — a
+  // SUPER_ADMIN can always be un-done via direct DB access, but nothing here
+  // exposes an undelete endpoint since the action is meant to stay rare and
+  // deliberate.
+  async remove(id: number, adminId: number) {
+    return this.prisma.$transaction(async (tx) => {
+      const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
+      if (!business) {
+        throw new NotFoundException(`Business ${id} not found`);
+      }
+
+      const updated = await tx.business.update({
+        where: { id },
+        data: { deletedAt: new Date() },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          actorId: adminId,
+          action: AuditAction.DELETE,
+          entityType: 'Business',
+          entityId: id,
+          before: { deletedAt: null } as Prisma.InputJsonValue,
+          after: { deletedAt: updated.deletedAt } as Prisma.InputJsonValue,
+        },
+      });
+
+      return { success: true };
+    });
   }
 
   private toListItem(business: ListRow) {
