@@ -276,8 +276,18 @@ async function seedBusinessTypes() {
 
 async function seedAdmin() {
   const phone = process.env.SEED_ADMIN_PHONE ?? '+998900000000';
-  const password = process.env.SEED_ADMIN_PASSWORD ?? 'ChangeMe123!';
   const email = process.env.SEED_ADMIN_EMAIL ?? 'admin@myandijan.uz';
+
+  // No fallback, deliberately. This creates an ADMIN account, so a default
+  // value here would be a working admin password published in the repository,
+  // and an unconfigured seed run would silently create a weak account. The
+  // phone and email above are safe to default; a credential is not.
+  const password = process.env.SEED_ADMIN_PASSWORD;
+  if (!password) {
+    throw new Error(
+      'SEED_ADMIN_PASSWORD is required to seed the admin account. Set it and re-run.',
+    );
+  }
 
   const passwordHash = await bcrypt.hash(password, 12);
 
