@@ -1,8 +1,36 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+build/
+
+# Environment / secrets — .env.example is the ONLY env file that may be committed
 .env
+.env.*
+!.env.example
+
+# Logs
 *.log
 npm-debug.log*
-.DS_Store
+yarn-debug.log*
+yarn-error.log*
+
+# Test output
 coverage/
+
+# Editors
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Platform / local tooling
+.vercel
+.railway
+*.local
