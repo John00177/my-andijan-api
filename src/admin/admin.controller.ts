@@ -29,6 +29,7 @@ import { CreateCategoryDto, ReorderCategoryItemDto, UpdateCategoryDto } from './
 import { UpdateCityDto, UpdateDistrictDto } from './dto/geography.dto';
 import { ListUsersAdminQueryDto } from './dto/user.dto';
 import { ListAuditQueryDto } from './dto/audit.dto';
+import { ListReviewsAdminQueryDto } from './dto/review.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -161,6 +162,11 @@ export class AdminController {
     @Body() dto: ResolveReportDto,
   ) {
     return this.adminService.resolveReport(id, admin.id, dto);
+  }
+
+  @Get('reviews')
+  findReviews(@Query() query: ListReviewsAdminQueryDto) {
+    return this.adminService.findReviews(query);
   }
 
   @Post('reviews/:id/hide')

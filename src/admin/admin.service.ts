@@ -34,6 +34,7 @@ import { CreateCategoryDto, ReorderCategoryItemDto, UpdateCategoryDto } from './
 import { UpdateCityDto, UpdateDistrictDto } from './dto/geography.dto';
 import { ListUsersAdminQueryDto } from './dto/user.dto';
 import { ListAuditQueryDto } from './dto/audit.dto';
+import { ListReviewsAdminQueryDto } from './dto/review.dto';
 
 function slugify(input: string): string {
   return input
@@ -655,6 +656,36 @@ export class AdminService {
 
       return updatedReport;
     });
+  }
+
+  // Mirrors findReports/findEvents below: same where/paginate/$transaction
+  // shape. Review moderation only ever needs the review's own fields plus
+  // who wrote it, which business it's against, and whether it already has an
+  // owner reply — nothing here duplicates ReviewsService, which owns
+  // create/update/reply and the aggregate-recalculation hideReview/
+  // restoreReview already call into.
+  async findReviews(query: ListReviewsAdminQueryDto) {
+    const { status, page, limit } = query;
+    const where: Prisma.ReviewWhereInput = { deletedAt: null, ...(status ? { status } : {}) };
+
+    const [data, total] = await this.prisma.$transaction([
+      this.prisma.review.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+        include: {
+          user: { select: { id: true, fullName: true, avatarUrl: true } },
+          branch: {
+            select: { id: true, name: true, business: { select: { id: true, slug: true, name: true } } },
+          },
+          reply: { select: { id: true, body: true, createdAt: true } },
+        },
+      }),
+      this.prisma.review.count({ where }),
+    ]);
+
+    return { data, meta: paginate(page, limit, total) };
   }
 
   async hideReview(id: number, adminId: number) {
