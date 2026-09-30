@@ -20,4 +20,18 @@ describe('SearchQueryDto', () => {
     const errors = await validate(dto);
     expect(errors.some((e) => e.property === 'limit')).toBe(true);
   });
+
+  it('accepts type=business and type=product', async () => {
+    for (const type of ['business', 'product']) {
+      const dto = plainToInstance(SearchQueryDto, { q: 'osh', type });
+      const errors = await validate(dto);
+      expect(errors.some((e) => e.property === 'type')).toBe(false);
+    }
+  });
+
+  it('rejects an unknown type value', async () => {
+    const dto = plainToInstance(SearchQueryDto, { q: 'osh', type: 'event' });
+    const errors = await validate(dto);
+    expect(errors.some((e) => e.property === 'type')).toBe(true);
+  });
 });

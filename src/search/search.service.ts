@@ -53,7 +53,13 @@ export class SearchService {
   // Both the page query and the count query run over the same candidate set,
   // so the CTE is built once and spliced into each.
   private buildHitsCte(query: SearchQueryDto): Prisma.Sql {
-    const { q, category } = query;
+    const { q, category, type } = query;
+
+    // Both CTEs are always defined below (cheap, and keeps this method
+    // simple); only the kind(s) requested are referenced in `hits`, so
+    // Postgres never executes an unreferenced CTE.
+    const includeBusiness = type !== 'product';
+    const includeProduct = type !== 'business';
 
     const businessCategory = category ? Prisma.sql`AND bc.slug = ${category}` : Prisma.empty;
     // A product matches the category filter through its own category or,
@@ -123,9 +129,13 @@ export class SearchService {
           ${productGeo}
       ),
       hits AS (
-        SELECT kind, id, score FROM business_hits
-        UNION ALL
-        SELECT kind, id, score FROM product_hits
+        ${Prisma.join(
+          [
+            ...(includeBusiness ? [Prisma.sql`SELECT kind, id, score FROM business_hits`] : []),
+            ...(includeProduct ? [Prisma.sql`SELECT kind, id, score FROM product_hits`] : []),
+          ],
+          ' UNION ALL ',
+        )}
       )
     `;
   }
