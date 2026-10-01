@@ -36,6 +36,25 @@ export class BusinessMenuController {
   }
 }
 
+// The owner-side read of the same catalog, under /me like every other owner
+// resource (/me/businesses, /me/reviews, /me/events, /me/claims). Not a
+// duplicate of GET /businesses/:id/menu: that one is public and shows only
+// active items of an APPROVED business, this one is ownership-checked and
+// shows deactivated items too so they can be managed and re-published.
+@ApiTags('menu')
+@ApiBearerAuth()
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(UserRole.BUSINESS_OWNER, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
+@Controller('me/businesses')
+export class OwnerMenuController {
+  constructor(private readonly productsService: ProductsService) {}
+
+  @Get(':id/menu')
+  findMine(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: AuthenticatedUser) {
+    return this.productsService.findForOwner(id, user);
+  }
+}
+
 @ApiTags('menu')
 @Controller('menu')
 export class MenuItemController {

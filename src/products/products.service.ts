@@ -1,5 +1,5 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { UserRole } from '@prisma/client';
+import { BusinessStatus, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { ROLE_HIERARCHY } from '../common/constants/role-hierarchy';
@@ -29,8 +29,15 @@ function slugify(input: string): string {
 export class ProductsService {
   constructor(private readonly prisma: PrismaService) {}
 
+  // PUBLIC list. Scoped to APPROVED businesses on purpose: GET /businesses/:id
+  // already 404s for anything else, so serving a DRAFT/PENDING/REJECTED/
+  // SUSPENDED/HIDDEN business's catalog here would publish the one part of an
+  // unpublished listing that the rest of the public API withholds. Owners read
+  // their own catalog through findForOwner instead, which has no status filter.
   async findForBusiness(businessId: number) {
-    const business = await this.prisma.business.findFirst({ where: { id: businessId, deletedAt: null } });
+    const business = await this.prisma.business.findFirst({
+      where: { id: businessId, status: BusinessStatus.APPROVED, deletedAt: null },
+    });
     if (!business) {
       throw new NotFoundException(`Business ${businessId} not found`);
     }
@@ -41,11 +48,27 @@ export class ProductsService {
     });
   }
 
+  // OWNER list — the management view. Includes isActive: false items (the
+  // public list hides them, so without this an owner could deactivate an item
+  // and never see it again to reactivate it) and ignores business status, since
+  // a newly submitted business sits at PENDING and still needs its catalog
+  // filled in before approval.
+  async findForOwner(businessId: number, user: AuthenticatedUser) {
+    const business = await this.getBusinessOrThrow(businessId);
+    this.assertCanManage(business, user);
+
+    return this.prisma.product.findMany({
+      where: { businessId, deletedAt: null },
+      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+    });
+  }
+
   async create(businessId: number, user: AuthenticatedUser, dto: CreateMenuItemDto) {
     const business = await this.getBusinessOrThrow(businessId);
     this.assertCanManage(business, user);
 
     const slug = await this.generateUniqueSlug(businessId, dto.name);
+    if (dto.categoryId != null) await this.assertCategoryExists(dto.categoryId);
 
     return this.prisma.product.create({
       data: {
@@ -55,13 +78,18 @@ export class ProductsService {
         description: dto.description,
         imageUrl: dto.photo,
         price: dto.price,
+        type: dto.type,
+        categoryId: dto.categoryId,
       },
     });
   }
 
   async update(id: number, user: AuthenticatedUser, dto: UpdateMenuItemDto) {
     const product = await this.getOwnedProduct(id, user);
+    if (dto.categoryId != null) await this.assertCategoryExists(dto.categoryId);
 
+    // Every field is left undefined when absent so Prisma skips it — a PATCH
+    // that only flips isActive must not blank out name/price/description.
     return this.prisma.product.update({
       where: { id: product.id },
       data: {
@@ -69,7 +97,10 @@ export class ProductsService {
         description: dto.description,
         imageUrl: dto.photo,
         price: dto.price,
+        type: dto.type,
+        categoryId: dto.categoryId,
         isAvailable: dto.isAvailable,
+        isActive: dto.isActive,
       },
     });
   }
@@ -91,6 +122,15 @@ export class ProductsService {
     }
     this.assertCanManage(product.business, user);
     return product;
+  }
+
+  // Same validation BusinessesService.update does for its categoryId, so a
+  // typo'd id fails loudly instead of silently landing a dangling reference.
+  private async assertCategoryExists(categoryId: number) {
+    const category = await this.prisma.category.findFirst({ where: { id: categoryId, deletedAt: null } });
+    if (!category) {
+      throw new NotFoundException(`Category ${categoryId} not found`);
+    }
   }
 
   private async getBusinessOrThrow(id: number) {
