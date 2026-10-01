@@ -1,8 +1,7 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { BusinessStatus, UserRole } from '@prisma/client';
+import { BusinessStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
-import { ROLE_HIERARCHY } from '../common/constants/role-hierarchy';
 import { CreateMenuItemDto } from './dto/create-menu-item.dto';
 import { UpdateMenuItemDto } from './dto/update-menu-item.dto';
 
@@ -55,7 +54,7 @@ export class ProductsService {
   // filled in before approval.
   async findForOwner(businessId: number, user: AuthenticatedUser) {
     const business = await this.getBusinessOrThrow(businessId);
-    this.assertCanManage(business, user);
+    this.assertOwner(business, user);
 
     return this.prisma.product.findMany({
       where: { businessId, deletedAt: null },
@@ -65,7 +64,7 @@ export class ProductsService {
 
   async create(businessId: number, user: AuthenticatedUser, dto: CreateMenuItemDto) {
     const business = await this.getBusinessOrThrow(businessId);
-    this.assertCanManage(business, user);
+    this.assertOwner(business, user);
 
     const slug = await this.generateUniqueSlug(businessId, dto.name);
     if (dto.categoryId != null) await this.assertCategoryExists(dto.categoryId);
@@ -120,7 +119,7 @@ export class ProductsService {
     if (!product) {
       throw new NotFoundException(`Menu item ${id} not found`);
     }
-    this.assertCanManage(product.business, user);
+    this.assertOwner(product.business, user);
     return product;
   }
 
@@ -141,11 +140,12 @@ export class ProductsService {
     return business;
   }
 
-  // Owner or ADMIN/MODERATOR/SUPER_ADMIN — same rule as BusinessesService.
-  private assertCanManage(business: { ownerId: number | null }, user: AuthenticatedUser) {
-    const isOwner = business.ownerId === user.id;
-    const isStaff = ROLE_HIERARCHY[user.role] >= ROLE_HIERARCHY[UserRole.MODERATOR];
-    if (!isOwner && !isStaff) {
+  // Ownership only, same rule as BusinessesService (Phase 15B, D-74). The old
+  // "owner OR rank >= MODERATOR" bypass let any moderator rewrite any
+  // catalog. Cross-business catalog editing by ADMIN is not offered at all
+  // until the capability phase decides whether it is wanted (15C open #9).
+  private assertOwner(business: { ownerId: number | null }, user: AuthenticatedUser) {
+    if (business.ownerId === null || business.ownerId !== user.id) {
       throw new ForbiddenException('You do not have permission to manage this menu');
     }
   }

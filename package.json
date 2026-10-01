@@ -30,6 +30,7 @@
     "@nestjs/passport": "^10.0.3",
     "@nestjs/platform-express": "^10.4.15",
     "@nestjs/swagger": "^7.4.2",
+    "@nestjs/throttler": "^6.7.1",
     "@prisma/client": "^5.22.0",
     "@supabase/supabase-js": "^2.112.3",
     "bcrypt": "^5.1.1",

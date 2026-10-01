@@ -1,14 +1,11 @@
 import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { UserRole } from '@prisma/client';
 import { ReviewsService } from './reviews.service';
 import { CreateReviewDto } from './dto/create-review.dto';
 import { UpdateReviewDto } from './dto/update-review.dto';
 import { CreateReplyDto } from './dto/create-reply.dto';
 import { CreateReviewReportDto } from './dto/create-review-report.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { RolesGuard } from '../common/guards/roles.guard';
-import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 
@@ -49,7 +46,7 @@ export class ReviewsController {
 
   // Any signed-in user can report a visible review — same authentication
   // model as writing one (POST /reviews), no role floor. Moderation of the
-  // resulting report stays ADMIN-only on /admin/reports.
+  // resulting report happens on /admin/reports (MODERATOR+, D-72).
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Post(':id/report')
@@ -61,9 +58,11 @@ export class ReviewsController {
     return this.reviewsService.report(id, user.id, dto);
   }
 
+  // Owner-only (Phase 15B, D-74): ReviewsService.reply requires that the
+  // caller owns the reviewed business. No @Roles floor — a reply speaks as
+  // the business, so rank must never be what admits someone here.
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.BUSINESS_OWNER)
+  @UseGuards(JwtAuthGuard)
   @Post(':id/reply')
   reply(
     @Param('id', ParseIntPipe) id: number,
@@ -78,8 +77,7 @@ export class ReviewsController {
   // either verb. Both hit the same ownership-checked service method; POST is
   // kept so nothing already using it breaks.
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.BUSINESS_OWNER)
+  @UseGuards(JwtAuthGuard)
   @Patch(':id/reply')
   replyPatch(
     @Param('id', ParseIntPipe) id: number,

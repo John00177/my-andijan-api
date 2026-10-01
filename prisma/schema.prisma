@@ -217,6 +217,12 @@ model User {
   gender   Gender?
   avatarId String? @map("avatar_id") @db.VarChar(40)
 
+  // Bumped whenever every existing session must die at once (password reset,
+  // suspension). Access tokens carry it as `sv`; JwtStrategy rejects a token
+  // whose `sv` no longer matches, so revocation is immediate rather than
+  // waiting out the 15-minute access-token lifetime (Phase 15B).
+  sessionVersion Int @default(0) @map("session_version")
+
   lastLoginAt DateTime? @map("last_login_at")
   createdAt   DateTime  @default(now()) @map("created_at")
   updatedAt   DateTime  @updatedAt @map("updated_at")
@@ -950,10 +956,16 @@ model AuditLog {
 
   before Json?
   after  Json?
+  // Free text; staff actions against someone else's records store the
+  // caller-supplied reason here (Phase 15B).
   note   String? @db.Text
 
-  ipAddress String? @map("ip_address") @db.VarChar(45)
-  userAgent String? @map("user_agent") @db.VarChar(500)
+  // Request context (Phase 15B): the actor's role as loaded for that request,
+  // a server-generated request id, and the edge-reported client address.
+  actorRole UserRole? @map("actor_role")
+  requestId String?   @map("request_id") @db.VarChar(64)
+  ipAddress String?   @map("ip_address") @db.VarChar(45)
+  userAgent String?   @map("user_agent") @db.VarChar(500)
 
   createdAt DateTime @default(now()) @map("created_at")
 

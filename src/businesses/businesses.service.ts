@@ -1,10 +1,11 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { AuditAction, BusinessStatus, EventStatus, Prisma, ReviewStatus, UserRole } from '@prisma/client';
+import { AuditAction, BusinessStatus, EventStatus, Prisma, ReviewStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { OwnerService } from '../owner/owner.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
-import { ROLE_HIERARCHY } from '../common/constants/role-hierarchy';
+import { auditRequestFields } from '../common/request-context/request-context';
 import { ListBusinessesQueryDto } from './dto/list-businesses-query.dto';
+import { replacePrimaryBranchHours } from './business-hours';
 import { CreateBusinessDto } from './dto/create-business.dto';
 import { UpdateBusinessDto } from './dto/update-business.dto';
 import { BusinessHourInputDto } from './dto/update-business-hours.dto';
@@ -253,15 +254,16 @@ export class BusinessesService {
   // ============================================================================
   // UPDATE  (PATCH /businesses/:id)
   //
-  // Distinct from OwnerService.updateMyBusiness: that path is owner-only via
-  // /me/businesses/:id, this one is the general-purpose endpoint reachable by
-  // moderation staff too, so ownership is checked here rather than baked
-  // into a userId-scoped query.
+  // OWNER-ONLY since Phase 15B (D-74). Staff no longer edit other people's
+  // businesses through here — ADMIN/SUPER_ADMIN use the audited, reason-
+  // carrying PATCH /admin/businesses/:id instead, and MODERATOR/SUPPORT have
+  // no business-edit authority at all. Role plays no part: an account of any
+  // role may edit exactly the businesses it owns.
   // ============================================================================
 
   async update(id: number, user: AuthenticatedUser, dto: UpdateBusinessDto) {
     const business = await this.getBusinessOrThrow(id);
-    this.assertCanManage(business, user);
+    this.assertOwner(business, user);
 
     if (dto.categoryId != null) {
       const category = await this.prisma.category.findFirst({ where: { id: dto.categoryId, deletedAt: null } });
@@ -274,44 +276,15 @@ export class BusinessesService {
   // ============================================================================
   // HOURS  (PUT /businesses/:id/hours)
   //
-  // Hours live on Branch, not Business (see schema notes on Business/Branch
-  // split) — this replaces the primary branch's hours, since that's the
-  // single set of hours the business detail page shows.
+  // Owner-only (Phase 15B, D-74); staff use PUT /admin/businesses/:id/hours.
+  // The replace-wholesale logic is shared with that route — see business-hours.ts.
   // ============================================================================
 
   async updateHours(id: number, user: AuthenticatedUser, hours: BusinessHourInputDto[]) {
     const business = await this.getBusinessOrThrow(id);
-    this.assertCanManage(business, user);
+    this.assertOwner(business, user);
 
-    const primaryBranch = await this.prisma.branch.findFirst({
-      where: { businessId: id, deletedAt: null },
-      orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
-    });
-    if (!primaryBranch) {
-      throw new NotFoundException(`Business ${id} has no branch to attach hours to`);
-    }
-
-    return this.prisma.$transaction(async (tx) => {
-      await tx.branchHour.deleteMany({ where: { branchId: primaryBranch.id } });
-
-      if (hours.length) {
-        await tx.branchHour.createMany({
-          data: hours.map((hour) => ({
-            branchId: primaryBranch.id,
-            dayOfWeek: hour.dayOfWeek,
-            openTime: hour.openTime,
-            closeTime: hour.closeTime,
-            isClosed: hour.isClosed ?? false,
-            is24Hours: hour.is24Hours ?? false,
-          })),
-        });
-      }
-
-      return tx.branchHour.findMany({
-        where: { branchId: primaryBranch.id },
-        orderBy: { dayOfWeek: 'asc' },
-      });
-    });
+    return this.prisma.$transaction(async (tx) => (await replacePrimaryBranchHours(tx, id, hours)).after);
   }
 
   private async getBusinessOrThrow(id: number) {
@@ -322,12 +295,10 @@ export class BusinessesService {
     return business;
   }
 
-  // Owner or ADMIN/MODERATOR/SUPER_ADMIN — RolesGuard alone can't express
-  // "owner OR role >= X", so the ownership half is checked here.
-  private assertCanManage(business: { ownerId: number | null }, user: AuthenticatedUser) {
-    const isOwner = business.ownerId === user.id;
-    const isStaff = ROLE_HIERARCHY[user.role] >= ROLE_HIERARCHY[UserRole.MODERATOR];
-    if (!isOwner && !isStaff) {
+  // Ownership is the whole check — no role bypass (Phase 15B removed the old
+  // "owner OR rank >= MODERATOR" rule, which let moderators edit any listing).
+  private assertOwner(business: { ownerId: number | null }, user: AuthenticatedUser) {
+    if (business.ownerId === null || business.ownerId !== user.id) {
       throw new ForbiddenException('You do not have permission to manage this business');
     }
   }
@@ -350,6 +321,7 @@ export class BusinessesService {
 
       await tx.auditLog.create({
         data: {
+          ...auditRequestFields(),
           actorId: adminId,
           action: AuditAction.DELETE,
           entityType: 'Business',

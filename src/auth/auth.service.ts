@@ -9,7 +9,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { OtpCode, OtpPurpose, UserRole, UserStatus } from '@prisma/client';
+import { AuditAction, OtpCode, OtpPurpose, Prisma, UserRole, UserStatus } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -25,6 +25,7 @@ import { UpdateProfileDto } from './dto/update-profile.dto';
 import { SmsService } from '../sms/sms.service';
 import { UploadService } from '../upload/upload.service';
 import { JwtPayload } from './strategies/jwt.strategy';
+import { auditRequestFields } from '../common/request-context/request-context';
 
 const BCRYPT_ROUNDS = 12;
 const RESET_CODE_TTL_MINUTES = 15;
@@ -97,7 +98,7 @@ export class AuthService {
       },
     });
 
-    const tokens = await this.issueTokens(user.id, user.phone, user.role);
+    const tokens = await this.issueTokens(user);
     return { user: this.sanitizeUser(user), ...tokens };
   }
 
@@ -121,7 +122,7 @@ export class AuthService {
       data: { lastLoginAt: new Date() },
     });
 
-    const tokens = await this.issueTokens(user.id, user.phone, user.role);
+    const tokens = await this.issueTokens(user);
     return { user: this.sanitizeUser(user), ...tokens };
   }
 
@@ -147,7 +148,7 @@ export class AuthService {
       data: { revokedAt: new Date() },
     });
 
-    const tokens = await this.issueTokens(stored.user.id, stored.user.phone, stored.user.role);
+    const tokens = await this.issueTokens(stored.user);
     return { user: this.sanitizeUser(stored.user), ...tokens };
   }
 
@@ -245,7 +246,7 @@ export class AuthService {
       }),
     ]);
 
-    const tokens = await this.issueTokens(user.id, user.phone, user.role);
+    const tokens = await this.issueTokens(user);
     return { user: this.sanitizeUser({ ...user, phoneVerified: true }), ...tokens };
   }
 
@@ -368,11 +369,37 @@ export class AuthService {
     }
 
     const passwordHash = await bcrypt.hash(dto.newPassword, BCRYPT_ROUNDS);
+    const now = new Date();
 
-    await this.prisma.$transaction([
-      this.prisma.user.update({ where: { phone: dto.phone }, data: { passwordHash } }),
-      this.prisma.otpCode.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
-    ]);
+    // One transaction: the new password, the end of every existing session
+    // (refresh tokens revoked; sessionVersion bumped so outstanding access
+    // tokens die on their next request) and the security audit row. Whoever
+    // held the old credentials — including an attacker — is signed out; the
+    // user signs in again with the new password (Phase 15B).
+    await this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.update({
+        where: { phone: dto.phone },
+        data: { passwordHash, sessionVersion: { increment: 1 } },
+      });
+      await tx.otpCode.update({ where: { id: record.id }, data: { usedAt: now } });
+      const revoked = await tx.refreshToken.updateMany({
+        where: { userId: user.id, revokedAt: null },
+        data: { revokedAt: now },
+      });
+      await tx.auditLog.create({
+        data: {
+          ...auditRequestFields(),
+          actorId: user.id,
+          actorRole: user.role,
+          action: AuditAction.UPDATE,
+          entityType: 'UserCredentials',
+          entityId: user.id,
+          before: {} as Prisma.InputJsonValue,
+          after: { passwordReset: true, sessionsRevoked: revoked.count } as Prisma.InputJsonValue,
+          note: 'Password reset via SMS code',
+        },
+      });
+    });
 
     return { message: "Parol o'zgartirildi" };
   }
@@ -407,8 +434,14 @@ export class AuthService {
     return null;
   }
 
-  private async issueTokens(userId: number, phone: string, role: UserRole): Promise<TokenPair> {
-    const payload: JwtPayload = { sub: userId, phone, role };
+  private async issueTokens(user: {
+    id: number;
+    phone: string;
+    role: UserRole;
+    sessionVersion: number;
+  }): Promise<TokenPair> {
+    const userId = user.id;
+    const payload: JwtPayload = { sub: user.id, phone: user.phone, role: user.role, sv: user.sessionVersion };
 
     const accessToken = await this.jwtService.signAsync(payload, {
       secret: process.env.JWT_ACCESS_SECRET,

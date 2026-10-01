@@ -57,6 +57,8 @@ describe('Business operations route authorization', () => {
         'POST /admin/categories': AdminController.prototype.createCategory,
         'PATCH /admin/businesses/:id': AdminController.prototype.updateBusiness,
         'PATCH /admin/businesses/:id/branch': AdminController.prototype.updateBusinessBranch,
+        // Phase 15B: the staff counterpart of the now owner-only hours route.
+        'PUT /admin/businesses/:id/hours': AdminController.prototype.updateBusinessHours,
         'POST /admin/businesses/:id/verify': AdminController.prototype.verifyBusiness,
         'POST /admin/businesses/:id/unverify': AdminController.prototype.unverifyBusiness,
         'POST /admin/businesses/:id/suspend': AdminController.prototype.suspendBusiness,

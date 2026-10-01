@@ -15,8 +15,11 @@ describe('ProductsService', () => {
 
   const owner: AuthenticatedUser = { id: 7, phone: '+998901234567', role: UserRole.BUSINESS_OWNER };
   const otherOwner: AuthenticatedUser = { id: 8, phone: '+998901234568', role: UserRole.BUSINESS_OWNER };
-  const moderator: AuthenticatedUser = { id: 9, phone: '+998901234569', role: UserRole.MODERATOR };
   const ownedBusiness = { id: 5, ownerId: 7, status: BusinessStatus.APPROVED };
+  // Every non-customer role other than BUSINESS_OWNER, all as id 30 (not the
+  // owner of ownedBusiness, which is user 7).
+  const STAFF_ROLES = [UserRole.SUPPORT, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN];
+  const staff = (role: UserRole): AuthenticatedUser => ({ id: 30, phone: '+998901234530', role });
 
   beforeEach(async () => {
     prisma = {
@@ -78,19 +81,18 @@ describe('ProductsService', () => {
       expect(prisma.product.findMany).not.toHaveBeenCalled();
     });
 
-    it('allows staff (MODERATOR and above) to list any catalog', async () => {
-      await service.findForOwner(5, moderator);
-      expect(prisma.product.findMany).toHaveBeenCalled();
+    // Phase 15B (D-74): no rank bypass. Every role that does not own the
+    // business is refused — staff included; ADMIN has no cross-business
+    // catalog path at all yet (15C open decision #9).
+    it.each(STAFF_ROLES)('refuses a %s who does not own the business', async (role) => {
+      await expect(service.findForOwner(5, staff(role))).rejects.toThrow(ForbiddenException);
+      expect(prisma.product.findMany).not.toHaveBeenCalled();
     });
 
-    // SUPPORT clears the route's @Roles(BUSINESS_OWNER) floor because it
-    // outranks BUSINESS_OWNER in ROLE_HIERARCHY, so the service layer is the
-    // only thing standing between a support agent and someone else's catalog.
-    it("refuses a SUPPORT user who does not own the business, even though the guard let them through", async () => {
-      const support: AuthenticatedUser = { id: 10, phone: '+998901234570', role: UserRole.SUPPORT };
-
-      await expect(service.findForOwner(5, support)).rejects.toThrow(ForbiddenException);
-      expect(prisma.product.findMany).not.toHaveBeenCalled();
+    it.each(STAFF_ROLES)('lets a %s list a catalog it owns — ownership, not role, decides', async (role) => {
+      prisma.business.findFirst.mockResolvedValue({ id: 5, ownerId: 30, status: BusinessStatus.APPROVED });
+      await service.findForOwner(5, staff(role));
+      expect(prisma.product.findMany).toHaveBeenCalled();
     });
 
     it('404s for a nonexistent business', async () => {
@@ -134,6 +136,11 @@ describe('ProductsService', () => {
 
     it("refuses to add an item to another owner's business", async () => {
       await expect(service.create(5, otherOwner, { name: 'X', price: 1 } as any)).rejects.toThrow(ForbiddenException);
+      expect(prisma.product.create).not.toHaveBeenCalled();
+    });
+
+    it.each(STAFF_ROLES)("refuses a %s adding to a catalog it doesn't own (no rank bypass)", async (role) => {
+      await expect(service.create(5, staff(role), { name: 'X', price: 1 } as any)).rejects.toThrow(ForbiddenException);
       expect(prisma.product.create).not.toHaveBeenCalled();
     });
 
@@ -204,6 +211,11 @@ describe('ProductsService', () => {
       expect(prisma.product.update).not.toHaveBeenCalled();
     });
 
+    it.each(STAFF_ROLES)("refuses a %s editing an item it doesn't own (no rank bypass)", async (role) => {
+      await expect(service.update(1, staff(role), { name: 'X' } as any)).rejects.toThrow(ForbiddenException);
+      expect(prisma.product.update).not.toHaveBeenCalled();
+    });
+
     it('404s for a nonexistent or already-deleted item', async () => {
       prisma.product.findFirst.mockResolvedValue(null);
       await expect(service.update(1, owner, { name: 'X' } as any)).rejects.toThrow(NotFoundException);
@@ -226,6 +238,13 @@ describe('ProductsService', () => {
       prisma.product.findFirst.mockResolvedValue({ id: 1, businessId: 5, business: ownedBusiness });
 
       await expect(service.remove(1, otherOwner)).rejects.toThrow(ForbiddenException);
+      expect(prisma.product.update).not.toHaveBeenCalled();
+    });
+
+    it.each(STAFF_ROLES)("refuses a %s deleting an item it doesn't own (no rank bypass)", async (role) => {
+      prisma.product.findFirst.mockResolvedValue({ id: 1, businessId: 5, business: ownedBusiness });
+
+      await expect(service.remove(1, staff(role))).rejects.toThrow(ForbiddenException);
       expect(prisma.product.update).not.toHaveBeenCalled();
     });
   });

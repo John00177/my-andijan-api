@@ -19,7 +19,6 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReviewsService } from '../reviews/reviews.service';
-import { ROLE_HIERARCHY } from '../common/constants/role-hierarchy';
 import {
   ListBusinessesAdminQueryDto,
   PromoteBusinessDto,
@@ -36,6 +35,11 @@ import { UpdateCityDto, UpdateDistrictDto } from './dto/geography.dto';
 import { ListUsersAdminQueryDto } from './dto/user.dto';
 import { ListAuditQueryDto } from './dto/audit.dto';
 import { ListReviewsAdminQueryDto } from './dto/review.dto';
+import { auditRequestFields } from '../common/request-context/request-context';
+import { replacePrimaryBranchHours } from '../businesses/business-hours';
+import { BusinessHourInputDto } from '../businesses/dto/update-business-hours.dto';
+import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+import { assertCanChangeUserStatus, isEmergencyFreeze } from './user-status.policy';
 
 function slugify(input: string): string {
   return input
@@ -45,9 +49,12 @@ function slugify(input: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
-// ADMIN and SUPER_ADMIN see PII that MODERATOR does not (D-72).
-function isAdminOrAbove(role: UserRole): boolean {
-  return ROLE_HIERARCHY[role] >= ROLE_HIERARCHY[UserRole.ADMIN];
+// ADMIN and SUPER_ADMIN see PII that MODERATOR does not (D-72). An explicit
+// set rather than a rank comparison (Phase 15B): adding a role above ADMIN
+// must not silently widen who sees owner phone/email.
+const CONTACT_DETAIL_ROLES: ReadonlySet<UserRole> = new Set([UserRole.ADMIN, UserRole.SUPER_ADMIN]);
+function canSeeContactDetails(role: UserRole): boolean {
+  return CONTACT_DETAIL_ROLES.has(role);
 }
 
 function paginate(page: number, limit: number, total: number) {
@@ -69,9 +76,15 @@ export class AdminService {
     entityId: number | null,
     before: unknown,
     after: unknown,
+    // The caller-supplied reason, for staff actions that require one.
+    note?: string,
   ) {
     await tx.auditLog.create({
       data: {
+        // requestId / ipAddress / userAgent / actorRole from the current HTTP
+        // request (Phase 15B); null outside one.
+        ...auditRequestFields(),
+        note: note ?? null,
         actorId,
         action,
         entityType,
@@ -130,7 +143,7 @@ export class AdminService {
   // contact fields are public listing data and are returned to both.
   async findBusinesses(query: ListBusinessesAdminQueryDto, viewerRole: UserRole) {
     const { status, district, search, page, limit } = query;
-    const ownerSelect = isAdminOrAbove(viewerRole)
+    const ownerSelect = canSeeContactDetails(viewerRole)
       ? { id: true, fullName: true, phone: true, email: true }
       : { id: true, fullName: true };
     const where: Prisma.BusinessWhereInput = {
@@ -227,36 +240,76 @@ export class AdminService {
     });
   }
 
-  // Core-field editing (name/description/category) — deliberately separate
-  // from every status-transition method above, which each carry their own
-  // side effects. This one is a plain field patch.
+  // Profile-field editing — deliberately separate from every status-transition
+  // method above, which each carry their own side effects. Since Phase 15B
+  // (D-74) this and its /branch and /hours siblings are the ONLY way staff
+  // change a business someone else owns; each requires a reason, kept as the
+  // audit note alongside before/after of exactly the fields sent.
   async updateBusiness(id: number, adminId: number, dto: UpdateBusinessDto) {
+    const { reason, ...fields } = dto;
+    const changed = Object.fromEntries(
+      Object.entries(fields).filter(([, value]) => value !== undefined),
+    ) as Omit<UpdateBusinessDto, 'reason'>;
+
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
       if (!business) throw new NotFoundException(`Business ${id} not found`);
 
-      if (dto.categoryId != null) {
-        const category = await tx.category.findFirst({ where: { id: dto.categoryId, deletedAt: null } });
-        if (!category) throw new NotFoundException(`Category ${dto.categoryId} not found`);
+      if (changed.categoryId != null) {
+        const category = await tx.category.findFirst({ where: { id: changed.categoryId, deletedAt: null } });
+        if (!category) throw new NotFoundException(`Category ${changed.categoryId} not found`);
       }
 
       const updated = await tx.business.update({
         where: { id },
-        data: { name: dto.name, description: dto.description, categoryId: dto.categoryId },
+        data: changed,
         include: { category: { select: { id: true, slug: true, nameUz: true } } },
       });
 
+      const keys = Object.keys(changed) as (keyof typeof changed)[];
       await this.writeAudit(
         tx,
         adminId,
         AuditAction.UPDATE,
         'Business',
         id,
-        { name: business.name, description: business.description, categoryId: business.categoryId },
-        { name: updated.name, description: updated.description, categoryId: updated.categoryId },
+        Object.fromEntries(keys.map((key) => [key, business[key]])),
+        Object.fromEntries(keys.map((key) => [key, updated[key]])),
+        reason,
       );
 
       return updated;
+    });
+  }
+
+  // Staff counterpart of the owner-only PUT /businesses/:id/hours.
+  async updateBusinessHours(id: number, adminId: number, reason: string, hours: BusinessHourInputDto[]) {
+    return this.prisma.$transaction(async (tx) => {
+      const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
+      if (!business) throw new NotFoundException(`Business ${id} not found`);
+
+      const { branchId, before, after } = await replacePrimaryBranchHours(tx, id, hours);
+      const summarize = (rows: typeof before) =>
+        rows.map(({ dayOfWeek, openTime, closeTime, isClosed, is24Hours }) => ({
+          dayOfWeek,
+          openTime,
+          closeTime,
+          isClosed,
+          is24Hours,
+        }));
+
+      await this.writeAudit(
+        tx,
+        adminId,
+        AuditAction.UPDATE,
+        'BranchHours',
+        branchId,
+        { businessId: id, hours: summarize(before) },
+        { businessId: id, hours: summarize(after) },
+        reason,
+      );
+
+      return after;
     });
   }
 
@@ -287,6 +340,7 @@ export class AdminService {
         branch.id,
         { phone: branch.phone, address: branch.address, districtId: branch.districtId },
         { phone: updated.phone, address: updated.address, districtId: updated.districtId },
+        dto.reason,
       );
 
       return updated;
@@ -753,7 +807,7 @@ export class AdminService {
   async findReports(query: ListReportsQueryDto, viewerRole: UserRole) {
     const { status, page, limit } = query;
     const where: Prisma.ReviewReportWhereInput = status ? { status } : {};
-    const reporterSelect = isAdminOrAbove(viewerRole) ? { id: true, fullName: true } : { id: true };
+    const reporterSelect = canSeeContactDetails(viewerRole) ? { id: true, fullName: true } : { id: true };
 
     const [data, total] = await this.prisma.$transaction([
       this.prisma.reviewReport.findMany({
@@ -1245,43 +1299,76 @@ export class AdminService {
     return { data, meta: paginate(page, limit, total) };
   }
 
-  async suspendUser(id: number, adminId: number) {
+  // Phase 15B (D-74). Who may suspend whom is the explicit table in
+  // user-status.policy.ts — never rank arithmetic. The transition is
+  // compare-and-set on BOTH status and role (a role change between our read
+  // and our write must not let the policy decision go stale), and in the same
+  // transaction every session of the target dies: refresh tokens are revoked
+  // and sessionVersion is bumped so outstanding access tokens fail their next
+  // request (JwtStrategy also rejects any non-ACTIVE account outright).
+  async suspendUser(id: number, actor: AuthenticatedUser, reason: string) {
     return this.prisma.$transaction(async (tx) => {
       const user = await this.getActionableUser(tx, id);
-      if (user.status === UserStatus.SUSPENDED) throw new ConflictException(`User ${id} is already suspended`);
-      // Not explicitly requested, but suspending the only class of account
-      // that can perform this action is a footgun worth blocking outright.
-      if (user.role === UserRole.ADMIN) throw new ForbiddenException('Cannot suspend an admin account');
+      assertCanChangeUserStatus(actor, user, 'suspend');
+      if (user.status !== UserStatus.ACTIVE) throw new ConflictException(`User ${id} is not active`);
 
-      const updated = await tx.user.update({ where: { id }, data: { status: UserStatus.SUSPENDED } });
+      const now = new Date();
+      const { count } = await tx.user.updateMany({
+        where: { id, status: UserStatus.ACTIVE, role: user.role, deletedAt: null },
+        data: { status: UserStatus.SUSPENDED, sessionVersion: { increment: 1 } },
+      });
+      if (count === 0) {
+        throw new ConflictException(`User ${id} changed concurrently; reload and try again`);
+      }
+      const revoked = await tx.refreshToken.updateMany({
+        where: { userId: id, revokedAt: null },
+        data: { revokedAt: now },
+      });
+      const updated = await tx.user.findUniqueOrThrow({ where: { id } });
+
+      // A SUPER_ADMIN suspending an ADMIN is an emergency freeze: containment
+      // only. Nothing in the API can lift it — that is reserved for the
+      // PLATFORM_OWNER governance plane (later phase).
+      const kind = isEmergencyFreeze(actor.role, user.role) ? 'EMERGENCY_FREEZE' : 'SUSPENSION';
       await this.writeAudit(
         tx,
-        adminId,
+        actor.id,
         AuditAction.SUSPEND,
         'User',
         id,
-        { status: user.status },
-        { status: updated.status },
+        { status: user.status, role: user.role },
+        { status: updated.status, kind, sessionsRevoked: revoked.count },
+        reason,
       );
 
       return this.sanitizeUser(updated);
     });
   }
 
-  async activateUser(id: number, adminId: number) {
+  async activateUser(id: number, actor: AuthenticatedUser, reason: string) {
     return this.prisma.$transaction(async (tx) => {
       const user = await this.getActionableUser(tx, id);
-      if (user.status === UserStatus.ACTIVE) throw new ConflictException(`User ${id} is already active`);
+      assertCanChangeUserStatus(actor, user, 'activate');
+      if (user.status !== UserStatus.SUSPENDED) throw new ConflictException(`User ${id} is not suspended`);
 
-      const updated = await tx.user.update({ where: { id }, data: { status: UserStatus.ACTIVE } });
+      const { count } = await tx.user.updateMany({
+        where: { id, status: UserStatus.SUSPENDED, role: user.role, deletedAt: null },
+        data: { status: UserStatus.ACTIVE },
+      });
+      if (count === 0) {
+        throw new ConflictException(`User ${id} changed concurrently; reload and try again`);
+      }
+      const updated = await tx.user.findUniqueOrThrow({ where: { id } });
+
       await this.writeAudit(
         tx,
-        adminId,
+        actor.id,
         AuditAction.RESTORE,
         'User',
         id,
-        { status: user.status },
+        { status: user.status, role: user.role },
         { status: updated.status },
+        reason,
       );
 
       return this.sanitizeUser(updated);

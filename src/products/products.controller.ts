@@ -1,14 +1,17 @@
 import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { UserRole } from '@prisma/client';
 import { ProductsService } from './products.service';
 import { CreateMenuItemDto } from './dto/create-menu-item.dto';
 import { UpdateMenuItemDto } from './dto/update-menu-item.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { RolesGuard } from '../common/guards/roles.guard';
-import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+
+// Every catalog write (and the owner-side read) is OWNER-ONLY since Phase 15B
+// (D-74): JwtAuthGuard authenticates, ProductsService checks ownership, and
+// there is deliberately no @Roles floor — a floor is what used to let SUPPORT
+// and MODERATOR in by rank. Role confers nothing here; owning the business
+// does.
 
 // Nested under /businesses (same base path BusinessesController uses) rather
 // than a route of its own, so a business's menu reads as part of the
@@ -24,8 +27,7 @@ export class BusinessMenuController {
   }
 
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.BUSINESS_OWNER, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @UseGuards(JwtAuthGuard)
   @Post(':id/menu')
   create(
     @Param('id', ParseIntPipe) id: number,
@@ -43,8 +45,7 @@ export class BusinessMenuController {
 // shows deactivated items too so they can be managed and re-published.
 @ApiTags('menu')
 @ApiBearerAuth()
-@UseGuards(JwtAuthGuard, RolesGuard)
-@Roles(UserRole.BUSINESS_OWNER, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
+@UseGuards(JwtAuthGuard)
 @Controller('me/businesses')
 export class OwnerMenuController {
   constructor(private readonly productsService: ProductsService) {}
@@ -61,8 +62,7 @@ export class MenuItemController {
   constructor(private readonly productsService: ProductsService) {}
 
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.BUSINESS_OWNER, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @UseGuards(JwtAuthGuard)
   @Patch(':id')
   update(
     @Param('id', ParseIntPipe) id: number,
@@ -73,8 +73,7 @@ export class MenuItemController {
   }
 
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.BUSINESS_OWNER, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @UseGuards(JwtAuthGuard)
   @Delete(':id')
   remove(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: AuthenticatedUser) {
     return this.productsService.remove(id, user);

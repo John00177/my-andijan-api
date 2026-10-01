@@ -59,12 +59,11 @@ export class BusinessesController {
     return this.businessesService.remove(id, admin.id);
   }
 
-  // Floor is BUSINESS_OWNER so a plain CUSTOMER can't call this at all —
-  // actual ownership (vs. staff override) is checked inside the service,
-  // since RolesGuard can only express a role floor, not "owner OR role >= X".
+  // Owner-only (Phase 15B, D-74): authentication here, OWNERSHIP in the
+  // service, and deliberately no @Roles — a rank floor is what used to let
+  // SUPPORT/MODERATOR through. Staff edits go via PATCH /admin/businesses/:id.
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.BUSINESS_OWNER, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @UseGuards(JwtAuthGuard)
   @Patch(':id')
   update(
     @Param('id', ParseIntPipe) id: number,
@@ -74,11 +73,11 @@ export class BusinessesController {
     return this.businessesService.update(id, user, dto);
   }
 
-  // Same ownership guard as PATCH :id — replaces the primary branch's hours
-  // wholesale (delete-then-create) from a plain array body.
+  // Same owner-only rule as PATCH :id — replaces the primary branch's hours
+  // wholesale (delete-then-create) from a plain array body. Staff use
+  // PUT /admin/businesses/:id/hours.
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.BUSINESS_OWNER, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @UseGuards(JwtAuthGuard)
   @Put(':id/hours')
   updateHours(
     @Param('id', ParseIntPipe) id: number,

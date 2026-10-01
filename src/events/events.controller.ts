@@ -1,12 +1,9 @@
 import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { UserRole } from '@prisma/client';
 import { EventsService } from './events.service';
 import { ListEventsQueryDto } from './dto/list-events-query.dto';
 import { CreateEventDto } from './dto/create-event.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { RolesGuard } from '../common/guards/roles.guard';
-import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 
@@ -20,9 +17,11 @@ export class EventsController {
     return this.eventsService.findAll(query);
   }
 
+  // Owner-only (Phase 15B, D-74): EventsService.create requires that the
+  // caller owns the business. No @Roles floor — it let SUPPORT/MODERATOR in
+  // by rank while adding nothing the ownership check doesn't already enforce.
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.BUSINESS_OWNER)
+  @UseGuards(JwtAuthGuard)
   @Post()
   create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateEventDto) {
     return this.eventsService.create(user, dto);

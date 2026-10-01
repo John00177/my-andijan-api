@@ -8,6 +8,7 @@ import {
   ParseIntPipe,
   Patch,
   Post,
+  Put,
   Query,
   UseGuards,
 } from '@nestjs/common';
@@ -15,6 +16,7 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { UserRole } from '@prisma/client';
 import { AdminService } from './admin.service';
 import {
+  AdminBusinessHoursDto,
   ListBusinessesAdminQueryDto,
   PromoteBusinessDto,
   RejectBusinessDto,
@@ -27,7 +29,7 @@ import { ListReportsQueryDto, ResolveReportDto } from './dto/report.dto';
 import { ListEventsAdminQueryDto, RejectEventDto } from './dto/event.dto';
 import { CreateCategoryDto, ReorderCategoryItemDto, UpdateCategoryDto } from './dto/category.dto';
 import { UpdateCityDto, UpdateDistrictDto } from './dto/geography.dto';
-import { ListUsersAdminQueryDto } from './dto/user.dto';
+import { ListUsersAdminQueryDto, UserStatusChangeDto } from './dto/user.dto';
 import { ListAuditQueryDto } from './dto/audit.dto';
 import { ListReviewsAdminQueryDto } from './dto/review.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -105,6 +107,17 @@ export class AdminController {
     @Body() dto: UpdateBusinessDto,
   ) {
     return this.adminService.updateBusiness(id, admin.id, dto);
+  }
+
+  // Staff counterpart of the owner-only PUT /businesses/:id/hours (Phase 15B):
+  // ADMIN floor from the class, a required reason, an audit row.
+  @Put('businesses/:id/hours')
+  updateBusinessHours(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() admin: AuthenticatedUser,
+    @Body() dto: AdminBusinessHoursDto,
+  ) {
+    return this.adminService.updateBusinessHours(id, admin.id, dto.reason, dto.hours);
   }
 
   @Patch('businesses/:id/branch')
@@ -299,14 +312,27 @@ export class AdminController {
     return this.adminService.findUsers(query);
   }
 
+  // ADMIN floor gets a caller here; WHICH accounts that caller may suspend or
+  // reinstate is decided per target in the service (user-status.policy.ts,
+  // Phase 15B): never yourself, never a SUPER_ADMIN, ADMIN only over
+  // CUSTOMER/BUSINESS_OWNER, SUPER_ADMIN also over MODERATOR/SUPPORT and an
+  // emergency freeze of an ADMIN.
   @Post('users/:id/suspend')
-  suspendUser(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
-    return this.adminService.suspendUser(id, admin.id);
+  suspendUser(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() admin: AuthenticatedUser,
+    @Body() dto: UserStatusChangeDto,
+  ) {
+    return this.adminService.suspendUser(id, admin, dto.reason);
   }
 
   @Post('users/:id/activate')
-  activateUser(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
-    return this.adminService.activateUser(id, admin.id);
+  activateUser(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() admin: AuthenticatedUser,
+    @Body() dto: UserStatusChangeDto,
+  ) {
+    return this.adminService.activateUser(id, admin, dto.reason);
   }
 
   // ---- 9. Audit ----------------------------------------------------------------

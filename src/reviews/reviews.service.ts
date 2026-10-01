@@ -1,7 +1,6 @@
 import { ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { BusinessStatus, Prisma, ReviewStatus, UserRole } from '@prisma/client';
+import { BusinessStatus, Prisma, ReviewStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { ROLE_HIERARCHY } from '../common/constants/role-hierarchy';
 import { HealthScoreService } from '../health-score/health-score.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { CreateReviewDto } from './dto/create-review.dto';
@@ -177,12 +176,11 @@ export class ReviewsService {
       throw new NotFoundException(`Review ${id} not found`);
     }
 
-    // Owner or ADMIN/MODERATOR/SUPER_ADMIN — the route's @Roles(BUSINESS_OWNER)
-    // guard already lets staff through via the hierarchy check, but this was
-    // still hard-blocking everyone except the literal owner underneath it.
-    const isOwner = review.branch.business.ownerId === user.id;
-    const isStaff = ROLE_HIERARCHY[user.role] >= ROLE_HIERARCHY[UserRole.MODERATOR];
-    if (!isOwner && !isStaff) {
+    // Owner only (Phase 15B, D-74). A reply is displayed as the business
+    // speaking, so no staff role may author one on a business it doesn't own —
+    // the old "rank >= MODERATOR" bypass let moderators answer as any business.
+    const ownerId = review.branch.business.ownerId;
+    if (ownerId === null || ownerId !== user.id) {
       throw new ForbiddenException('Only the owner of this business can reply to this review');
     }
 
