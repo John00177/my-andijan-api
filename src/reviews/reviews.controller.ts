@@ -5,6 +5,7 @@ import { ReviewsService } from './reviews.service';
 import { CreateReviewDto } from './dto/create-review.dto';
 import { UpdateReviewDto } from './dto/update-review.dto';
 import { CreateReplyDto } from './dto/create-reply.dto';
+import { CreateReviewReportDto } from './dto/create-review-report.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -44,6 +45,20 @@ export class ReviewsController {
   @Delete(':id')
   remove(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: AuthenticatedUser) {
     return this.reviewsService.remove(id, user.id);
+  }
+
+  // Any signed-in user can report a visible review — same authentication
+  // model as writing one (POST /reviews), no role floor. Moderation of the
+  // resulting report stays ADMIN-only on /admin/reports.
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Post(':id/report')
+  report(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: CreateReviewReportDto,
+  ) {
+    return this.reviewsService.report(id, user.id, dto);
   }
 
   @ApiBearerAuth()

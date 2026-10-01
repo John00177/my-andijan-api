@@ -1,5 +1,5 @@
 import { ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, ReviewStatus, UserRole } from '@prisma/client';
+import { BusinessStatus, Prisma, ReviewStatus, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ROLE_HIERARCHY } from '../common/constants/role-hierarchy';
 import { HealthScoreService } from '../health-score/health-score.service';
@@ -8,6 +8,7 @@ import { CreateReviewDto } from './dto/create-review.dto';
 import { CreateBusinessReviewDto } from './dto/create-business-review.dto';
 import { UpdateReviewDto } from './dto/update-review.dto';
 import { CreateReplyDto } from './dto/create-reply.dto';
+import { CreateReviewReportDto } from './dto/create-review-report.dto';
 
 const REVIEW_INCLUDE = {
   user: { select: { id: true, fullName: true, avatarUrl: true } },
@@ -127,6 +128,44 @@ export class ReviewsService {
 
     await this.recalculateAggregates(review.branchId);
     return { success: true };
+  }
+
+  // Customer-facing report — the producer for the existing admin moderation
+  // queue (GET /admin/reports), which had no way to be filled before. Only a
+  // review the reporter could actually see is reportable: PUBLISHED, not
+  // deleted, on a non-deleted branch of an APPROVED business; anything else
+  // 404s, matching public visibility. One report per user per review is the
+  // schema's @@unique([reviewId, reporterId]) — a repeat is 409. reportCount
+  // (shown in the admin queue) is incremented in the same transaction.
+  async report(id: number, userId: number, dto: CreateReviewReportDto) {
+    const review = await this.prisma.review.findFirst({
+      where: {
+        id,
+        deletedAt: null,
+        status: ReviewStatus.PUBLISHED,
+        branch: { deletedAt: null, business: { status: BusinessStatus.APPROVED, deletedAt: null } },
+      },
+      select: { id: true },
+    });
+    if (!review) {
+      throw new NotFoundException(`Review ${id} not found`);
+    }
+
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const report = await tx.reviewReport.create({
+          data: { reviewId: id, reporterId: userId, reason: dto.reason, note: dto.note },
+          select: { id: true, reviewId: true, reason: true, status: true, createdAt: true },
+        });
+        await tx.review.update({ where: { id }, data: { reportCount: { increment: 1 } } });
+        return report;
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('You have already reported this review');
+      }
+      throw error;
+    }
   }
 
   async reply(id: number, user: AuthenticatedUser, dto: CreateReplyDto) {
