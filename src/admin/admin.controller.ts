@@ -109,6 +109,13 @@ export class AdminController {
     return this.adminService.verifyBusiness(id, admin.id);
   }
 
+  // Reversals below (unverify/unsuspend/unpromote) inherit the class-level
+  // ADMIN floor — the same level as the action they undo. No lower override.
+  @Post('businesses/:id/unverify')
+  unverifyBusiness(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
+    return this.adminService.unverifyBusiness(id, admin.id);
+  }
+
   @Post('businesses/:id/suspend')
   suspendBusiness(
     @Param('id', ParseIntPipe) id: number,
@@ -118,6 +125,11 @@ export class AdminController {
     return this.adminService.suspendBusiness(id, admin.id, dto);
   }
 
+  @Post('businesses/:id/unsuspend')
+  unsuspendBusiness(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
+    return this.adminService.unsuspendBusiness(id, admin.id);
+  }
+
   @Post('businesses/:id/promote')
   promoteBusiness(
     @Param('id', ParseIntPipe) id: number,
@@ -125,6 +137,11 @@ export class AdminController {
     @Body() dto: PromoteBusinessDto,
   ) {
     return this.adminService.promoteBusiness(id, admin.id, dto);
+  }
+
+  @Post('businesses/:id/unpromote')
+  unpromoteBusiness(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
+    return this.adminService.unpromoteBusiness(id, admin.id);
   }
 
   // ---- 3. Claims ------------------------------------------------------------

@@ -371,6 +371,30 @@ export class AdminService {
     });
   }
 
+  // Reversal of verifyBusiness. Only isVerified is cleared: verifiedAt/
+  // verifiedById are also written by approveBusiness as the approval record,
+  // so wiping them here would erase who approved the listing. The public
+  // badge reads isVerified alone (D-58), and the audit row keeps the history.
+  async unverifyBusiness(id: number, adminId: number) {
+    return this.prisma.$transaction(async (tx) => {
+      const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
+      if (!business) throw new NotFoundException(`Business ${id} not found`);
+      if (!business.isVerified) throw new ConflictException(`Business ${id} is not verified`);
+
+      const updated = await tx.business.update({ where: { id }, data: { isVerified: false } });
+
+      await this.writeAudit(tx, adminId, AuditAction.UPDATE, 'Business', id, { isVerified: true }, { isVerified: false });
+
+      return updated;
+    });
+  }
+
+  // Suspension pulls a LIVE listing, so only APPROVED businesses qualify.
+  // That restriction is what makes unsuspendBusiness safe: since a suspended
+  // business was always APPROVED before, restoring it to APPROVED can never
+  // skip review of a PENDING listing or undo a SUPER_ADMIN-only hide.
+  // The status check is repeated in the UPDATE's WHERE (compare-and-set, as
+  // with claims — D-60) so two concurrent transitions can't both apply.
   async suspendBusiness(id: number, adminId: number, dto: SuspendBusinessDto) {
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
@@ -378,13 +402,18 @@ export class AdminService {
       if (business.status === BusinessStatus.SUSPENDED) {
         throw new ConflictException(`Business ${id} is already suspended`);
       }
+      if (business.status !== BusinessStatus.APPROVED) {
+        throw new ConflictException(`Only an approved business can be suspended (current status: ${business.status})`);
+      }
 
       // rejectionReason is reused as the general "why this listing isn't
       // live" field — the schema has no separate suspensionReason column.
-      const updated = await tx.business.update({
-        where: { id },
+      const { count } = await tx.business.updateMany({
+        where: { id, status: BusinessStatus.APPROVED, deletedAt: null },
         data: { status: BusinessStatus.SUSPENDED, rejectionReason: dto.reason },
       });
+      if (count === 0) throw new ConflictException(`Business ${id} changed status concurrently`);
+      const updated = await tx.business.findUniqueOrThrow({ where: { id } });
 
       await this.writeAudit(
         tx,
@@ -394,6 +423,35 @@ export class AdminService {
         id,
         { status: business.status },
         { status: updated.status, rejectionReason: updated.rejectionReason },
+      );
+
+      return updated;
+    });
+  }
+
+  async unsuspendBusiness(id: number, adminId: number) {
+    return this.prisma.$transaction(async (tx) => {
+      const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
+      if (!business) throw new NotFoundException(`Business ${id} not found`);
+      if (business.status !== BusinessStatus.SUSPENDED) {
+        throw new ConflictException(`Business ${id} is not suspended (current status: ${business.status})`);
+      }
+
+      const { count } = await tx.business.updateMany({
+        where: { id, status: BusinessStatus.SUSPENDED, deletedAt: null },
+        data: { status: BusinessStatus.APPROVED, rejectionReason: null },
+      });
+      if (count === 0) throw new ConflictException(`Business ${id} changed status concurrently`);
+      const updated = await tx.business.findUniqueOrThrow({ where: { id } });
+
+      await this.writeAudit(
+        tx,
+        adminId,
+        AuditAction.RESTORE,
+        'Business',
+        id,
+        { status: business.status, rejectionReason: business.rejectionReason },
+        { status: updated.status, rejectionReason: null },
       );
 
       return updated;
@@ -423,6 +481,33 @@ export class AdminService {
         id,
         { isPromoted: business.isPromoted, promotedUntil: business.promotedUntil },
         { isPromoted: true, promotedUntil: until },
+      );
+
+      return updated;
+    });
+  }
+
+  // Ends a promotion early. Allowed even if promotedUntil has already passed,
+  // so a stale isPromoted flag can be cleaned up.
+  async unpromoteBusiness(id: number, adminId: number) {
+    return this.prisma.$transaction(async (tx) => {
+      const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
+      if (!business) throw new NotFoundException(`Business ${id} not found`);
+      if (!business.isPromoted) throw new ConflictException(`Business ${id} is not promoted`);
+
+      const updated = await tx.business.update({
+        where: { id },
+        data: { isPromoted: false, promotedUntil: null },
+      });
+
+      await this.writeAudit(
+        tx,
+        adminId,
+        AuditAction.UPDATE,
+        'Business',
+        id,
+        { isPromoted: true, promotedUntil: business.promotedUntil },
+        { isPromoted: false, promotedUntil: null },
       );
 
       return updated;
@@ -641,10 +726,13 @@ export class AdminService {
         throw new ConflictException(`Report ${id} has already been resolved (status: ${report.status})`);
       }
 
+      // DISMISS records DISMISSED, not RESOLVED: the enum has both, and
+      // collapsing them made "no action taken" indistinguishable from
+      // "review hidden" in the report history.
       const updatedReport = await tx.reviewReport.update({
         where: { id },
         data: {
-          status: ReportStatus.RESOLVED,
+          status: dto.action === ReportResolveAction.DISMISS ? ReportStatus.DISMISSED : ReportStatus.RESOLVED,
           resolvedById: adminId,
           resolvedAt: new Date(),
           resolutionNote: dto.note,
