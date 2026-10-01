@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { BusinessStatus, ClaimStatus, EventStatus, Prisma, ReviewStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReviewsService } from '../reviews/reviews.service';
@@ -13,6 +13,7 @@ import { CreateBranchDto } from './dto/create-branch.dto';
 import { UpdateBranchDto } from './dto/update-branch.dto';
 import { UpdateMyEventDto } from './dto/update-my-event.dto';
 import { PaginationQueryDto } from './dto/pagination.dto';
+import { CreateClaimDto } from './dto/create-claim.dto';
 
 function slugify(input: string): string {
   return input
@@ -498,5 +499,45 @@ export class OwnerService {
     ]);
 
     return { data, meta: paginate(page, limit, total) };
+  }
+
+  // A claim establishes "I represent this listing" for a business the
+  // directory already carries with no owner (ownerId null, e.g. seeded or
+  // added by an admin). This is distinct from POST /me/businesses, which
+  // creates a brand-new listing that is owned by its submitter from the
+  // start — there is nothing to "claim" there.
+  async createClaim(user: AuthenticatedUser, dto: CreateClaimDto) {
+    const business = await this.prisma.business.findFirst({
+      where: { id: dto.businessId, deletedAt: null },
+    });
+    if (!business) {
+      throw new NotFoundException(`Business ${dto.businessId} not found`);
+    }
+    if (business.status !== BusinessStatus.APPROVED) {
+      throw new BadRequestException('Only an approved, publicly listed business can be claimed');
+    }
+    if (business.ownerId !== null) {
+      throw new ConflictException('This business is already claimed');
+    }
+
+    const existingPending = await this.prisma.businessClaim.findFirst({
+      where: { businessId: dto.businessId, claimantId: user.id, status: ClaimStatus.PENDING },
+    });
+    if (existingPending) {
+      throw new ConflictException('You already have a pending claim for this business');
+    }
+
+    return this.prisma.businessClaim.create({
+      data: {
+        businessId: dto.businessId,
+        claimantId: user.id,
+        evidence: dto.evidence,
+        contactPhone: dto.contactPhone,
+        contactNote: dto.contactNote,
+      },
+      include: {
+        business: { select: { id: true, slug: true, name: true } },
+      },
+    });
   }
 }

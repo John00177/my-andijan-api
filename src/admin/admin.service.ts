@@ -455,13 +455,39 @@ export class AdminService {
     return { data, meta: paginate(page, limit, total) };
   }
 
+  // Every state change in approveClaim/rejectClaim is a compare-and-set
+  // (updateMany with the expected current value in WHERE), never
+  // read-then-write. Under Postgres a concurrent UPDATE of the same row blocks
+  // on the row lock and then re-checks its WHERE against the committed row, so
+  // only one of two racing approvals can match `ownerId IS NULL`, and only one
+  // approve/reject can match `status = PENDING`. A lost race throws, which
+  // rolls back the whole interactive transaction — so ownership is never
+  // assigned without the claim being APPROVED, and vice versa.
   async approveClaim(id: number, adminId: number) {
     return this.prisma.$transaction(async (tx) => {
       const claim = await this.getPendingClaim(tx, id);
 
-      const updatedClaim = await tx.businessClaim.update({
-        where: { id },
-        data: { status: ClaimStatus.APPROVED, reviewedById: adminId, reviewedAt: new Date() },
+      const assigned = await tx.business.updateMany({
+        where: { id: claim.businessId, ownerId: null },
+        data: { ownerId: claim.claimantId },
+      });
+      if (assigned.count === 0) {
+        throw new ConflictException(`Business ${claim.businessId} already has an owner`);
+      }
+      await this.writeAudit(
+        tx,
+        adminId,
+        AuditAction.UPDATE,
+        'Business',
+        claim.businessId,
+        { ownerId: null },
+        { ownerId: claim.claimantId },
+      );
+
+      const updatedClaim = await this.transitionPendingClaim(tx, id, {
+        status: ClaimStatus.APPROVED,
+        reviewedById: adminId,
+        reviewedAt: new Date(),
       });
       await this.writeAudit(
         tx,
@@ -469,20 +495,8 @@ export class AdminService {
         AuditAction.APPROVE,
         'BusinessClaim',
         id,
-        { status: claim.status },
+        { status: ClaimStatus.PENDING },
         { status: updatedClaim.status },
-      );
-
-      const business = await tx.business.findUniqueOrThrow({ where: { id: claim.businessId } });
-      await tx.business.update({ where: { id: claim.businessId }, data: { ownerId: claim.claimantId } });
-      await this.writeAudit(
-        tx,
-        adminId,
-        AuditAction.UPDATE,
-        'Business',
-        claim.businessId,
-        { ownerId: business.ownerId },
-        { ownerId: claim.claimantId },
       );
 
       const claimant = await tx.user.findUniqueOrThrow({ where: { id: claim.claimantId } });
@@ -506,8 +520,8 @@ export class AdminService {
         where: { businessId: claim.businessId, status: ClaimStatus.PENDING, id: { not: claim.id } },
       });
       for (const other of others) {
-        await tx.businessClaim.update({
-          where: { id: other.id },
+        const rejected = await tx.businessClaim.updateMany({
+          where: { id: other.id, status: ClaimStatus.PENDING },
           data: {
             status: ClaimStatus.REJECTED,
             reviewedById: adminId,
@@ -515,6 +529,7 @@ export class AdminService {
             rejectionReason: 'Another claim for this business was approved',
           },
         });
+        if (rejected.count === 0) continue;
         await this.writeAudit(
           tx,
           adminId,
@@ -534,14 +549,11 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const claim = await this.getPendingClaim(tx, id);
 
-      const updated = await tx.businessClaim.update({
-        where: { id },
-        data: {
-          status: ClaimStatus.REJECTED,
-          rejectionReason: dto.reason,
-          reviewedById: adminId,
-          reviewedAt: new Date(),
-        },
+      const updated = await this.transitionPendingClaim(tx, id, {
+        status: ClaimStatus.REJECTED,
+        rejectionReason: dto.reason,
+        reviewedById: adminId,
+        reviewedAt: new Date(),
       });
 
       await this.writeAudit(
@@ -567,6 +579,21 @@ export class AdminService {
       throw new ConflictException(`Claim ${id} has already been reviewed (status: ${claim.status})`);
     }
     return claim;
+  }
+
+  // The early getPendingClaim() read gives a friendly 404/409; this
+  // conditional write is what actually guarantees a concurrent reviewer
+  // can't flip the same claim twice.
+  private async transitionPendingClaim(
+    tx: Prisma.TransactionClient,
+    id: number,
+    data: Prisma.BusinessClaimUncheckedUpdateManyInput,
+  ) {
+    const result = await tx.businessClaim.updateMany({ where: { id, status: ClaimStatus.PENDING }, data });
+    if (result.count === 0) {
+      throw new ConflictException(`Claim ${id} has already been reviewed`);
+    }
+    return tx.businessClaim.findUniqueOrThrow({ where: { id } });
   }
 
   // ============================================================================

@@ -7,6 +7,7 @@ import { CreateBranchDto } from './dto/create-branch.dto';
 import { UpdateBranchDto } from './dto/update-branch.dto';
 import { UpdateMyEventDto } from './dto/update-my-event.dto';
 import { PaginationQueryDto } from './dto/pagination.dto';
+import { CreateClaimDto } from './dto/create-claim.dto';
 import { CreateReplyDto } from '../reviews/dto/create-reply.dto';
 import { CreateEventDto } from '../events/dto/create-event.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -118,5 +119,13 @@ export class OwnerController {
   @Get('claims')
   findMyClaims(@CurrentUser() user: AuthenticatedUser, @Query() query: PaginationQueryDto) {
     return this.ownerService.findMyClaims(user.id, query);
+  }
+
+  // Floor is "any authenticated user" (same as POST /businesses) — a claim is
+  // how an unverified representative first establishes a relationship to a
+  // business, so it can't require already being a BUSINESS_OWNER.
+  @Post('claims')
+  createClaim(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateClaimDto) {
+    return this.ownerService.createClaim(user, dto);
   }
 }
