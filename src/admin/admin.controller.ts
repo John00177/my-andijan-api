@@ -53,9 +53,13 @@ export class AdminController {
 
   // ---- 2. Business moderation -------------------------------------------------
 
+  // MODERATOR+ (Phase 14, D-72): moderators need the PENDING queue to act on
+  // approve/reject. Owner phone/email are stripped for MODERATOR in the
+  // service; every other business route stays ADMIN-only.
+  @Roles(UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
   @Get('businesses')
-  findBusinesses(@Query() query: ListBusinessesAdminQueryDto) {
-    return this.adminService.findBusinesses(query);
+  findBusinesses(@Query() query: ListBusinessesAdminQueryDto, @CurrentUser() viewer: AuthenticatedUser) {
+    return this.adminService.findBusinesses(query, viewer.role);
   }
 
   // Overrides the class-level @Roles(ADMIN) floor down to MODERATOR for
@@ -84,6 +88,14 @@ export class AdminController {
   @Patch('businesses/:id/hide')
   hideBusiness(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
     return this.adminService.hideBusiness(id, admin.id);
+  }
+
+  // Reversal of /hide, same SUPER_ADMIN-only floor (Phase 14, D-73). Restores
+  // the status recorded at hide time, or PENDING when none was recorded.
+  @Roles(UserRole.SUPER_ADMIN)
+  @Patch('businesses/:id/unhide')
+  unhideBusiness(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
+    return this.adminService.unhideBusiness(id, admin.id);
   }
 
   @Patch('businesses/:id')
@@ -167,11 +179,15 @@ export class AdminController {
 
   // ---- 4. Reviews & reports ---------------------------------------------------
 
+  // Review & report moderation is MODERATOR+ (Phase 14, D-72). The reporter
+  // is reduced to an id for MODERATOR in the service.
+  @Roles(UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
   @Get('reports')
-  findReports(@Query() query: ListReportsQueryDto) {
-    return this.adminService.findReports(query);
+  findReports(@Query() query: ListReportsQueryDto, @CurrentUser() viewer: AuthenticatedUser) {
+    return this.adminService.findReports(query, viewer.role);
   }
 
+  @Roles(UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
   @Post('reports/:id/resolve')
   resolveReport(
     @Param('id', ParseIntPipe) id: number,
@@ -181,16 +197,19 @@ export class AdminController {
     return this.adminService.resolveReport(id, admin.id, dto);
   }
 
+  @Roles(UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
   @Get('reviews')
   findReviews(@Query() query: ListReviewsAdminQueryDto) {
     return this.adminService.findReviews(query);
   }
 
+  @Roles(UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
   @Post('reviews/:id/hide')
   hideReview(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
     return this.adminService.hideReview(id, admin.id);
   }
 
+  @Roles(UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
   @Post('reviews/:id/restore')
   restoreReview(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
     return this.adminService.restoreReview(id, admin.id);

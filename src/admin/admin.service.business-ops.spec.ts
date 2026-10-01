@@ -14,8 +14,8 @@ describe('AdminService — business operations', () => {
   let prisma: {
     $transaction: jest.Mock;
     business: { findFirst: jest.Mock; update: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock };
-    reviewReport: { findUnique: jest.Mock; update: jest.Mock };
-    review: { update: jest.Mock };
+    reviewReport: { findUnique: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock };
+    review: { updateMany: jest.Mock };
     auditLog: { create: jest.Mock };
   };
 
@@ -41,8 +41,15 @@ describe('AdminService — business operations', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         findUniqueOrThrow: jest.fn(),
       },
-      reviewReport: { findUnique: jest.fn(), update: jest.fn(({ data }) => Promise.resolve({ id: 3, ...data })) },
-      review: { update: jest.fn(({ data }) => Promise.resolve({ id: 11, ...data })) },
+      reviewReport: {
+        findUnique: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        // Returns the row as the last compare-and-set wrote it.
+        findUniqueOrThrow: jest.fn(() =>
+          Promise.resolve({ id: 3, ...prisma.reviewReport.updateMany.mock.calls.at(-1)?.[0].data }),
+        ),
+      },
+      review: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
       auditLog: { create: jest.fn() },
     };
     reviewsService = { recalculateAggregates: jest.fn() };
@@ -262,11 +269,11 @@ describe('AdminService — business operations', () => {
       const result = await service.resolveReport(3, ADMIN_ID, { action: ReportResolveAction.DISMISS });
 
       expect(result.status).toBe(ReportStatus.DISMISSED);
-      expect(prisma.reviewReport.update).toHaveBeenCalledWith({
-        where: { id: 3 },
+      expect(prisma.reviewReport.updateMany).toHaveBeenCalledWith({
+        where: { id: 3, status: ReportStatus.PENDING },
         data: expect.objectContaining({ status: ReportStatus.DISMISSED, resolvedById: ADMIN_ID }),
       });
-      expect(prisma.review.update).not.toHaveBeenCalled();
+      expect(prisma.review.updateMany).not.toHaveBeenCalled();
       expect(reviewsService.recalculateAggregates).not.toHaveBeenCalled();
     });
 
@@ -276,11 +283,33 @@ describe('AdminService — business operations', () => {
       const result = await service.resolveReport(3, ADMIN_ID, { action: ReportResolveAction.HIDE_REVIEW, note: 'Spam' });
 
       expect(result.status).toBe(ReportStatus.RESOLVED);
-      expect(prisma.review.update).toHaveBeenCalledWith({
-        where: { id: 11 },
+      expect(prisma.review.updateMany).toHaveBeenCalledWith({
+        where: { id: 11, status: ReviewStatus.PUBLISHED },
         data: { status: ReviewStatus.HIDDEN, moderationNote: 'Spam' },
       });
       expect(reviewsService.recalculateAggregates).toHaveBeenCalledWith(2, prisma);
+    });
+
+    it('409s when another moderator resolves the same report first (compare-and-set lost)', async () => {
+      prisma.reviewReport.findUnique.mockResolvedValue(pendingReport);
+      prisma.reviewReport.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.resolveReport(3, ADMIN_ID, { action: ReportResolveAction.HIDE_REVIEW }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.review.updateMany).not.toHaveBeenCalled();
+      expect(prisma.auditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('does not double-hide or re-audit a review another moderator already hid', async () => {
+      prisma.reviewReport.findUnique.mockResolvedValue(pendingReport);
+      prisma.review.updateMany.mockResolvedValue({ count: 0 });
+
+      const result = await service.resolveReport(3, ADMIN_ID, { action: ReportResolveAction.HIDE_REVIEW });
+
+      expect(result.status).toBe(ReportStatus.RESOLVED);
+      expect(prisma.auditLog.create).toHaveBeenCalledTimes(1); // the report only
+      expect(reviewsService.recalculateAggregates).not.toHaveBeenCalled();
     });
 
     it('refuses to resolve a report twice (409)', async () => {

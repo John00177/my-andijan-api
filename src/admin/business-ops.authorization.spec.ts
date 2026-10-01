@@ -31,16 +31,30 @@ describe('Business operations route authorization', () => {
 
   const groups: { floor: UserRole; routes: Record<string, (...args: never[]) => unknown> }[] = [
     {
+      // Phase 14 moderator policy (D-72): exactly the business-approval and
+      // review/report moderation surface — nothing else.
       floor: UserRole.MODERATOR,
       routes: {
+        'GET /admin/businesses': AdminController.prototype.findBusinesses,
         'POST /admin/businesses/:id/approve': AdminController.prototype.approveBusiness,
         'POST /admin/businesses/:id/reject': AdminController.prototype.rejectBusiness,
+        'GET /admin/reviews': AdminController.prototype.findReviews,
+        'POST /admin/reviews/:id/hide': AdminController.prototype.hideReview,
+        'POST /admin/reviews/:id/restore': AdminController.prototype.restoreReview,
+        'GET /admin/reports': AdminController.prototype.findReports,
+        'POST /admin/reports/:id/resolve': AdminController.prototype.resolveReport,
       },
     },
     {
       floor: UserRole.ADMIN,
       routes: {
-        'GET /admin/businesses': AdminController.prototype.findBusinesses,
+        'GET /admin/stats': AdminController.prototype.getStats,
+        'GET /admin/users': AdminController.prototype.findUsers,
+        'POST /admin/users/:id/suspend': AdminController.prototype.suspendUser,
+        'POST /admin/users/:id/activate': AdminController.prototype.activateUser,
+        'GET /admin/audit': AdminController.prototype.findAuditLogs,
+        'POST /admin/events/:id/approve': AdminController.prototype.approveEvent,
+        'POST /admin/categories': AdminController.prototype.createCategory,
         'PATCH /admin/businesses/:id': AdminController.prototype.updateBusiness,
         'PATCH /admin/businesses/:id/branch': AdminController.prototype.updateBusinessBranch,
         'POST /admin/businesses/:id/verify': AdminController.prototype.verifyBusiness,
@@ -49,14 +63,13 @@ describe('Business operations route authorization', () => {
         'POST /admin/businesses/:id/unsuspend': AdminController.prototype.unsuspendBusiness,
         'POST /admin/businesses/:id/promote': AdminController.prototype.promoteBusiness,
         'POST /admin/businesses/:id/unpromote': AdminController.prototype.unpromoteBusiness,
-        'GET /admin/reports': AdminController.prototype.findReports,
-        'POST /admin/reports/:id/resolve': AdminController.prototype.resolveReport,
       },
     },
     {
       floor: UserRole.SUPER_ADMIN,
       routes: {
         'PATCH /admin/businesses/:id/hide': AdminController.prototype.hideBusiness,
+        'PATCH /admin/businesses/:id/unhide': AdminController.prototype.unhideBusiness,
       },
     },
   ];
@@ -85,6 +98,14 @@ describe('Business operations route authorization', () => {
       });
     }
   }
+
+  it('never lets SUPPORT reach any moderation route (SUPPORT ranks below MODERATOR)', () => {
+    for (const { routes } of groups) {
+      for (const handler of Object.values(routes)) {
+        expect(guard.canActivate(contextFor(handler, UserRole.SUPPORT))).toBe(false);
+      }
+    }
+  });
 
   it('never lets a BUSINESS_OWNER reach any business operation', () => {
     for (const { routes } of groups) {

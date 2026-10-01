@@ -19,6 +19,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReviewsService } from '../reviews/reviews.service';
+import { ROLE_HIERARCHY } from '../common/constants/role-hierarchy';
 import {
   ListBusinessesAdminQueryDto,
   PromoteBusinessDto,
@@ -42,6 +43,11 @@ function slugify(input: string): string {
     .replace(/['’ʻʼ`]/g, '')
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
+}
+
+// ADMIN and SUPER_ADMIN see PII that MODERATOR does not (D-72).
+function isAdminOrAbove(role: UserRole): boolean {
+  return ROLE_HIERARCHY[role] >= ROLE_HIERARCHY[UserRole.ADMIN];
 }
 
 function paginate(page: number, limit: number, total: number) {
@@ -118,8 +124,15 @@ export class AdminService {
   // 2. BUSINESS MODERATION
   // ============================================================================
 
-  async findBusinesses(query: ListBusinessesAdminQueryDto) {
+  // MODERATOR+ (Phase 14, D-72). Owner contact details (phone/email) are only
+  // returned to ADMIN+; a MODERATOR reviewing a listing needs who owns it, not
+  // how to reach them, so they get { id, fullName } only. The business's own
+  // contact fields are public listing data and are returned to both.
+  async findBusinesses(query: ListBusinessesAdminQueryDto, viewerRole: UserRole) {
     const { status, district, search, page, limit } = query;
+    const ownerSelect = isAdminOrAbove(viewerRole)
+      ? { id: true, fullName: true, phone: true, email: true }
+      : { id: true, fullName: true };
     const where: Prisma.BusinessWhereInput = {
       deletedAt: null,
       ...(status ? { status } : {}),
@@ -134,7 +147,7 @@ export class AdminService {
         skip: (page - 1) * limit,
         take: limit,
         include: {
-          owner: { select: { id: true, fullName: true, phone: true, email: true } },
+          owner: { select: ownerSelect },
           category: { select: { id: true, slug: true, nameUz: true } },
           businessType: { select: { id: true, slug: true, nameUz: true } },
           branches: {
@@ -160,14 +173,13 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await this.getPendingBusiness(tx, id);
 
-      const updated = await tx.business.update({
-        where: { id },
-        data: {
-          status: BusinessStatus.APPROVED,
-          verifiedById: adminId,
-          verifiedAt: new Date(),
-          rejectionReason: null,
-        },
+      // Compare-and-set: approve and reject are now open to every MODERATOR,
+      // so two moderators acting on the same listing must not both win.
+      const updated = await this.transitionBusiness(tx, id, BusinessStatus.PENDING, {
+        status: BusinessStatus.APPROVED,
+        verifiedById: adminId,
+        verifiedAt: new Date(),
+        rejectionReason: null,
       });
 
       await this.writeAudit(
@@ -293,9 +305,11 @@ export class AdminService {
         throw new ConflictException(`Business ${id} is already hidden`);
       }
 
-      const updated = await tx.business.update({
-        where: { id },
-        data: { status: BusinessStatus.HIDDEN },
+      // The prior status goes into its own column (not just the audit JSON)
+      // so unhide can restore it from durable state (D-73).
+      const updated = await this.transitionBusiness(tx, id, business.status, {
+        status: BusinessStatus.HIDDEN,
+        statusBeforeHide: business.status,
       });
 
       await this.writeAudit(
@@ -305,7 +319,41 @@ export class AdminService {
         'Business',
         id,
         { status: business.status },
-        { status: updated.status },
+        { status: updated.status, statusBeforeHide: business.status },
+      );
+
+      return updated;
+    });
+  }
+
+  // SUPER_ADMIN-only reversal of hideBusiness (D-73). Restores the status
+  // recorded at hide time; when none is recorded (hidden before Phase 14, or
+  // by any path that didn't record it) it restores PENDING — re-review —
+  // rather than guessing. Never reads the audit log as a state source.
+  async unhideBusiness(id: number, adminId: number) {
+    return this.prisma.$transaction(async (tx) => {
+      const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
+      if (!business) throw new NotFoundException(`Business ${id} not found`);
+      if (business.status !== BusinessStatus.HIDDEN) {
+        throw new ConflictException(`Business ${id} is not hidden (current status: ${business.status})`);
+      }
+
+      const recorded = business.statusBeforeHide;
+      const restoredStatus = recorded && recorded !== BusinessStatus.HIDDEN ? recorded : BusinessStatus.PENDING;
+
+      const updated = await this.transitionBusiness(tx, id, BusinessStatus.HIDDEN, {
+        status: restoredStatus,
+        statusBeforeHide: null,
+      });
+
+      await this.writeAudit(
+        tx,
+        adminId,
+        AuditAction.RESTORE,
+        'Business',
+        id,
+        { status: BusinessStatus.HIDDEN, statusBeforeHide: recorded },
+        { status: restoredStatus, restoredFrom: recorded ? 'statusBeforeHide' : 'fallback:PENDING' },
       );
 
       return updated;
@@ -316,9 +364,9 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await this.getPendingBusiness(tx, id);
 
-      const updated = await tx.business.update({
-        where: { id },
-        data: { status: BusinessStatus.REJECTED, rejectionReason: dto.reason },
+      const updated = await this.transitionBusiness(tx, id, BusinessStatus.PENDING, {
+        status: BusinessStatus.REJECTED,
+        rejectionReason: dto.reason,
       });
 
       await this.writeAudit(
@@ -333,6 +381,20 @@ export class AdminService {
 
       return updated;
     });
+  }
+
+  // Compare-and-set status transition (same technique as claims, D-60): the
+  // UPDATE only matches while the business is still in `expected`, so of two
+  // concurrent moderators exactly one wins and the other gets 409.
+  private async transitionBusiness(
+    tx: Prisma.TransactionClient,
+    id: number,
+    expected: BusinessStatus,
+    data: Prisma.BusinessUncheckedUpdateManyInput,
+  ) {
+    const { count } = await tx.business.updateMany({ where: { id, status: expected, deletedAt: null }, data });
+    if (count === 0) throw new ConflictException(`Business ${id} changed status concurrently`);
+    return tx.business.findUniqueOrThrow({ where: { id } });
   }
 
   private async getPendingBusiness(tx: Prisma.TransactionClient, id: number) {
@@ -685,9 +747,13 @@ export class AdminService {
   // 4. REVIEWS & REPORTS
   // ============================================================================
 
-  async findReports(query: ListReportsQueryDto) {
+  // MODERATOR+ (Phase 14, D-72). Who filed a report is not needed to judge
+  // the reported review, so a MODERATOR gets the reporter's opaque id only
+  // (enough to spot one account mass-reporting); the name is ADMIN+.
+  async findReports(query: ListReportsQueryDto, viewerRole: UserRole) {
     const { status, page, limit } = query;
     const where: Prisma.ReviewReportWhereInput = status ? { status } : {};
+    const reporterSelect = isAdminOrAbove(viewerRole) ? { id: true, fullName: true } : { id: true };
 
     const [data, total] = await this.prisma.$transaction([
       this.prisma.reviewReport.findMany({
@@ -696,7 +762,7 @@ export class AdminService {
         skip: (page - 1) * limit,
         take: limit,
         include: {
-          reporter: { select: { id: true, fullName: true } },
+          reporter: { select: reporterSelect },
           review: {
             select: {
               id: true,
@@ -729,8 +795,10 @@ export class AdminService {
       // DISMISS records DISMISSED, not RESOLVED: the enum has both, and
       // collapsing them made "no action taken" indistinguishable from
       // "review hidden" in the report history.
-      const updatedReport = await tx.reviewReport.update({
-        where: { id },
+      // Compare-and-set on PENDING so two moderators can't both resolve the
+      // same report (e.g. one hides, one dismisses).
+      const { count } = await tx.reviewReport.updateMany({
+        where: { id, status: ReportStatus.PENDING },
         data: {
           status: dto.action === ReportResolveAction.DISMISS ? ReportStatus.DISMISSED : ReportStatus.RESOLVED,
           resolvedById: adminId,
@@ -738,6 +806,8 @@ export class AdminService {
           resolutionNote: dto.note,
         },
       });
+      if (count === 0) throw new ConflictException(`Report ${id} was resolved concurrently`);
+      const updatedReport = await tx.reviewReport.findUniqueOrThrow({ where: { id } });
       await this.writeAudit(
         tx,
         adminId,
@@ -750,10 +820,14 @@ export class AdminService {
 
       if (dto.action === ReportResolveAction.HIDE_REVIEW && report.review.status !== ReviewStatus.HIDDEN) {
         const review = report.review;
-        const updatedReview = await tx.review.update({
-          where: { id: review.id },
+        // Conditional too: if another moderator hid the review meanwhile,
+        // this is a no-op rather than a duplicate transition.
+        const hidden = await tx.review.updateMany({
+          where: { id: review.id, status: review.status },
           data: { status: ReviewStatus.HIDDEN, moderationNote: dto.note ?? review.moderationNote },
         });
+        if (hidden.count === 0) return updatedReport;
+
         await this.writeAudit(
           tx,
           adminId,
@@ -761,7 +835,7 @@ export class AdminService {
           'Review',
           review.id,
           { status: review.status },
-          { status: updatedReview.status },
+          { status: ReviewStatus.HIDDEN },
         );
 
         // Same transaction, per spec — this is the tx client, not a
@@ -809,7 +883,7 @@ export class AdminService {
       if (!review) throw new NotFoundException(`Review ${id} not found`);
       if (review.status === ReviewStatus.HIDDEN) throw new ConflictException(`Review ${id} is already hidden`);
 
-      const updated = await tx.review.update({ where: { id }, data: { status: ReviewStatus.HIDDEN } });
+      const updated = await this.transitionReview(tx, id, review.status, ReviewStatus.HIDDEN);
       await this.writeAudit(
         tx,
         adminId,
@@ -833,7 +907,7 @@ export class AdminService {
         throw new ConflictException(`Review ${id} is already published`);
       }
 
-      const updated = await tx.review.update({ where: { id }, data: { status: ReviewStatus.PUBLISHED } });
+      const updated = await this.transitionReview(tx, id, review.status, ReviewStatus.PUBLISHED);
       await this.writeAudit(
         tx,
         adminId,
@@ -847,6 +921,19 @@ export class AdminService {
       await this.reviewsService.recalculateAggregates(review.branchId, tx);
       return updated;
     });
+  }
+
+  // Compare-and-set for review moderation, now shared by every MODERATOR:
+  // only applies while the review is still in the status that was read.
+  private async transitionReview(
+    tx: Prisma.TransactionClient,
+    id: number,
+    expected: ReviewStatus,
+    next: ReviewStatus,
+  ) {
+    const { count } = await tx.review.updateMany({ where: { id, status: expected, deletedAt: null }, data: { status: next } });
+    if (count === 0) throw new ConflictException(`Review ${id} changed status concurrently`);
+    return tx.review.findUniqueOrThrow({ where: { id } });
   }
 
   // ============================================================================

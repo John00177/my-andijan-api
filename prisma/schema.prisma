@@ -477,6 +477,10 @@ model Business {
   verifiedAt      DateTime?      @map("verified_at")
   verifiedById    Int?           @map("verified_by_id")
   rejectionReason String?        @map("rejection_reason") @db.Text
+  // Status the business had when a SUPER_ADMIN hid it; written by hide, read
+  // and cleared by unhide. Null = not hidden, or hidden before this column
+  // existed — unhide then falls back to PENDING instead of guessing (D-73).
+  statusBeforeHide BusinessStatus? @map("status_before_hide")
 
   // MVP promotion flags (real ad module lands in Phase 2 with payments)
   isPromoted    Boolean   @default(false) @map("is_promoted")
