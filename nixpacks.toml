@@ -1,0 +1,9 @@
+# Railway builds this service with NODE_ENV=production set, and `npm ci`
+# skips devDependencies when NODE_ENV=production — including @nestjs/cli,
+# which `npm run build` (`nest build`) needs. Builds used to pass only
+# because the builder implicitly set npm's production=false; when that
+# stopped being applied (2026-10-01), installs dropped from 689 to 218
+# packages and the build failed with "nest: not found". Making the install
+# explicit keeps the build independent of that implicit default.
+[phases.install]
+cmds = ["npm ci --include=dev"]
