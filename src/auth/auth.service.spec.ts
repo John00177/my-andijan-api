@@ -13,6 +13,7 @@ jest.mock('bcrypt');
 
 describe('AuthService.login', () => {
   let service: AuthService;
+  const signAsync = jest.fn().mockResolvedValue('signed-jwt');
   let prisma: {
     user: { findUnique: jest.Mock; update: jest.Mock };
     authSession: { create: jest.Mock };
@@ -40,7 +41,7 @@ describe('AuthService.login', () => {
       providers: [
         AuthService,
         { provide: PrismaService, useValue: prisma },
-        { provide: JwtService, useValue: { signAsync: jest.fn().mockResolvedValue('signed-jwt') } },
+        { provide: JwtService, useValue: { signAsync } },
         { provide: SmsService, useValue: {} },
         { provide: UploadService, useValue: {} },
       ],
@@ -107,6 +108,11 @@ describe('AuthService.login', () => {
     const result = await service.login({ phone: baseUser.phone, password: 'correct' });
 
     expect(prisma.authSession.create).toHaveBeenCalledTimes(1);
+    // The access token is bound to the session just created (Phase 15E.4d.1).
+    expect(signAsync).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sub: baseUser.id, sid: 1 }),
+      expect.objectContaining({ secret: process.env.JWT_ACCESS_SECRET }),
+    );
     const { data } = prisma.authSession.create.mock.calls[0][0];
     expect(data.userId).toBe(baseUser.id);
     const lifetime = data.absoluteExpiresAt.getTime() - data.createdAt.getTime();
