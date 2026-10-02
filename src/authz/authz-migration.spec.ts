@@ -160,11 +160,12 @@ function legacyDecision(rule: Legacy, role: UserRole | null): 'allow' | 'unauthe
 }
 
 // THE intended changes, listed route by route. Owner capabilities belong to
-// BUSINESS_OWNER, ADMIN and SUPER_ADMIN only (the frontend's owner area was
-// already limited to exactly those roles); CUSTOMER keeps claiming. Under the
-// rank model these routes were open to any signed-in account, the service
-// then checking ownership. Now SUPPORT and MODERATOR — and, for operating or
-// creating listings, CUSTOMER — are refused at the route.
+// BUSINESS_OWNER only; CUSTOMER keeps claiming. Under the rank model these
+// routes were open to any signed-in account, the service then checking
+// ownership. Now SUPPORT and every platform staff role (MODERATOR, and since
+// Phase 15D.2 ADMIN and SUPER_ADMIN) — and, for operating or creating
+// listings, CUSTOMER — are refused at the route. Staff administer other
+// owners' listings through /admin (`business.edit_any` etc.), unchanged.
 const OWNER_ROUTES = [
   'POST /businesses',
   'PATCH /businesses/:id',
@@ -205,15 +206,19 @@ const INTENDED: Record<string, { roles: UserRole[]; reason: string }> = {
     OWNER_ROUTES.map((route) => [
       route,
       {
-        roles: [UserRole.CUSTOMER, UserRole.SUPPORT, UserRole.MODERATOR],
-        reason: 'owner capabilities (business.create / business.manage_own) are not held by CUSTOMER, SUPPORT or MODERATOR (D-75)',
+        roles: [UserRole.CUSTOMER, UserRole.SUPPORT, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN],
+        reason:
+          'owner capabilities (business.create / business.manage_own) are held by BUSINESS_OWNER only — not CUSTOMER, SUPPORT or platform staff (D-75, 15D.2)',
       },
     ]),
   ),
   ...Object.fromEntries(
     CLAIM_ROUTES.map((route) => [
       route,
-      { roles: [UserRole.SUPPORT, UserRole.MODERATOR], reason: 'business.claim is not held by SUPPORT or MODERATOR (D-75)' },
+      {
+        roles: [UserRole.SUPPORT, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN],
+        reason: 'business.claim is not held by SUPPORT or platform staff (D-75, 15D.2)',
+      },
     ]),
   ),
 };

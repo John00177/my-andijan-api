@@ -28,9 +28,10 @@ const ROLES = Object.values(UserRole);
 const HOLDERS: Record<string, UserRole[]> = {
   'review.write': ROLES,
   'review.report': ROLES,
-  'business.claim': [UserRole.CUSTOMER, UserRole.BUSINESS_OWNER, UserRole.ADMIN, UserRole.SUPER_ADMIN],
-  'business.create': [UserRole.BUSINESS_OWNER, UserRole.ADMIN, UserRole.SUPER_ADMIN],
-  'business.manage_own': [UserRole.BUSINESS_OWNER, UserRole.ADMIN, UserRole.SUPER_ADMIN],
+  // Owner capabilities: never platform staff (Phase 15D.2).
+  'business.claim': [UserRole.CUSTOMER, UserRole.BUSINESS_OWNER],
+  'business.create': [UserRole.BUSINESS_OWNER],
+  'business.manage_own': [UserRole.BUSINESS_OWNER],
   'business.review': [UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN],
   'review.moderate': [UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN],
   'report.resolve': [UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN],

@@ -31,10 +31,9 @@ export class BusinessesController {
     private readonly reviewsService: ReviewsService,
   ) {}
 
-  // Floor is CUSTOMER — the lowest role in the list — so under the hierarchy
-  // guard ANY authenticated user can submit a business. It always lands as
-  // PENDING; the submitter's role is untouched until an admin/moderator
-  // approves it (see AdminService.approveBusiness).
+  // `business.create` — BUSINESS_OWNER only (D-75; platform staff hold no
+  // owner capability since Phase 15D.2). It always lands as PENDING until
+  // another staff member approves it (see AdminService.approveBusiness).
   @ApiBearerAuth()
   @RequireCapability('business.create')
   @Post()

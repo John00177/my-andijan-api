@@ -44,10 +44,10 @@ describe('Owner routes require business.manage_own (ownership checked in the ser
     expect(ruleOf(controller, handler)).toEqual({ kind: 'capability', capabilities: ['business.manage_own'] });
   });
 
-  it.each(routes)('%s: SUPPORT, MODERATOR and CUSTOMER are refused at the route — no owner capability (D-75)', (_r, controller, handler) => {
+  it.each(routes)('%s: CUSTOMER, SUPPORT and platform staff (MODERATOR, ADMIN, SUPER_ADMIN) are refused at the route — no owner capability (D-75, 15D.2)', (_r, controller, handler) => {
     const rule = ruleOf(controller, handler);
-    for (const role of [UserRole.SUPPORT, UserRole.MODERATOR, UserRole.CUSTOMER]) expect(decide(rule, role)).toBe('forbidden');
-    for (const role of [UserRole.BUSINESS_OWNER, UserRole.ADMIN, UserRole.SUPER_ADMIN]) expect(decide(rule, role)).toBe('allow');
+    for (const role of [UserRole.SUPPORT, UserRole.MODERATOR, UserRole.CUSTOMER, UserRole.ADMIN, UserRole.SUPER_ADMIN]) expect(decide(rule, role)).toBe('forbidden');
+    expect(decide(rule, UserRole.BUSINESS_OWNER)).toBe('allow');
     expect(decide(rule, null)).toBe('unauthenticated');
   });
 });

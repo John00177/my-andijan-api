@@ -6,7 +6,7 @@ import { decide, ruleOf } from '../authz/decide';
 // @Public; every catalog write — and the owner-side read — requires
 // `business.manage_own` at the route AND ownership of the business in
 // ProductsService (products.service.spec.ts has the per-role ownership
-// matrix). SUPPORT and MODERATOR hold no owner capability.
+// matrix). SUPPORT and platform staff hold no owner capability (15D.2).
 describe('Catalog route authorization', () => {
   it('leaves the public catalog read open (anonymous customers can browse a menu)', () => {
     const rule = ruleOf(BusinessMenuController, BusinessMenuController.prototype.findAll);
@@ -25,10 +25,10 @@ describe('Catalog route authorization', () => {
     expect(ruleOf(controller, handler)).toEqual({ kind: 'capability', capabilities: ['business.manage_own'] });
   });
 
-  it.each(ownerRoutes)('%s: refused to CUSTOMER, SUPPORT, MODERATOR and anonymous callers', (_route, controller, handler) => {
+  it.each(ownerRoutes)('%s: refused to CUSTOMER, SUPPORT, platform staff (MODERATOR, ADMIN, SUPER_ADMIN) and anonymous callers', (_route, controller, handler) => {
     const rule = ruleOf(controller, handler);
-    for (const role of [UserRole.CUSTOMER, UserRole.SUPPORT, UserRole.MODERATOR]) expect(decide(rule, role)).toBe('forbidden');
-    for (const role of [UserRole.BUSINESS_OWNER, UserRole.ADMIN, UserRole.SUPER_ADMIN]) expect(decide(rule, role)).toBe('allow');
+    for (const role of [UserRole.CUSTOMER, UserRole.SUPPORT, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN]) expect(decide(rule, role)).toBe('forbidden');
+    expect(decide(rule, UserRole.BUSINESS_OWNER)).toBe('allow');
     expect(decide(rule, null)).toBe('unauthenticated');
   });
 });

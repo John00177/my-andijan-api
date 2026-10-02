@@ -58,9 +58,12 @@ const OPERATIONS: Capability[] = [
 // - SUPPORT holds no business-owner capability: it is not a business owner.
 //   (Its future support-desk capabilities are a later phase.)
 // - MODERATOR holds moderation only — no edit, operations, PII or analytics.
-// - ADMIN and SUPER_ADMIN may also run listings of their own (the owner
-//   dashboard has always been open to them); conflict-of-interest policies
-//   keep them from moderating or operating on those listings.
+// - Platform staff (MODERATOR / ADMIN / SUPER_ADMIN) hold NO business-owner
+//   capability (Phase 15D.2): staff authority is platform capabilities, not
+//   ownership. They administer other owners' listings through /admin with
+//   explicit capabilities such as `business.edit_any`; someone who also runs
+//   a business does so from a BUSINESS_OWNER account. Business-scoped staff
+//   (future) will be membership, not a role.
 // - SUPER_ADMIN differs from ADMIN by three explicit capabilities, and holds
 //   NO governance authority: governance is not a capability (see
 //   @RequireGovernance, which denies everything until that plane exists).
@@ -69,10 +72,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
   [UserRole.BUSINESS_OWNER]: new Set<Capability>([...MEMBER, ...OWNER]),
   [UserRole.SUPPORT]: new Set<Capability>([...MEMBER]),
   [UserRole.MODERATOR]: new Set<Capability>([...MEMBER, ...MODERATION]),
-  [UserRole.ADMIN]: new Set<Capability>([...MEMBER, ...OWNER, ...MODERATION, ...OPERATIONS]),
+  [UserRole.ADMIN]: new Set<Capability>([...MEMBER, ...MODERATION, ...OPERATIONS]),
   [UserRole.SUPER_ADMIN]: new Set<Capability>([
     ...MEMBER,
-    ...OWNER,
     ...MODERATION,
     ...OPERATIONS,
     'business.hide',

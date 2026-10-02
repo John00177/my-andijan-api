@@ -8,6 +8,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AdminService } from '../admin/admin.service';
 import { CommandCenterService } from '../command-center/command-center.service';
 import { BusinessesService } from '../businesses/businesses.service';
+import { OwnerService } from '../owner/owner.service';
 import { CategoriesService } from '../categories/categories.service';
 import { UploadService } from '../upload/upload.service';
 
@@ -31,7 +32,12 @@ describe('Authorization end-to-end (real AppModule)', () => {
   let app: INestApplication;
   let base: string;
   const tokens: Partial<Record<UserRole, string>> = {};
-  const admin = { getStats: jest.fn().mockResolvedValue({ ok: 'stats' }), findBusinesses: jest.fn().mockResolvedValue({ data: [] }) };
+  const admin = {
+    getStats: jest.fn().mockResolvedValue({ ok: 'stats' }),
+    findBusinesses: jest.fn().mockResolvedValue({ data: [] }),
+    updateBusiness: jest.fn().mockResolvedValue({ ok: 'updated' }),
+  };
+  const owner = { findMyBusinesses: jest.fn().mockResolvedValue([]) };
   const businesses = { update: jest.fn().mockResolvedValue({ ok: 'updated' }), findAll: jest.fn().mockResolvedValue({ data: [] }) };
 
   beforeAll(async () => {
@@ -53,6 +59,8 @@ describe('Authorization end-to-end (real AppModule)', () => {
       .useValue(admin)
       .overrideProvider(BusinessesService)
       .useValue(businesses)
+      .overrideProvider(OwnerService)
+      .useValue(owner)
       .overrideProvider(CommandCenterService)
       .useValue({})
       .overrideProvider(CategoriesService)
@@ -126,10 +134,36 @@ describe('Authorization end-to-end (real AppModule)', () => {
     [UserRole.BUSINESS_OWNER, 200],
     [UserRole.SUPPORT, 403],
     [UserRole.MODERATOR, 403],
-    [UserRole.ADMIN, 200],
-    [UserRole.SUPER_ADMIN, 200],
+    [UserRole.ADMIN, 403],
+    [UserRole.SUPER_ADMIN, 403],
   ])('PATCH /businesses/:id (business.manage_own) as %s → %s', async (role, status) => {
     expect(await call('PATCH', '/businesses/5', role, { name: 'X' })).toBe(status);
+  });
+
+  // Phase 15D.2: platform staff hold no owner capability — the owner
+  // dashboard is BUSINESS_OWNER only, refused at the guard for every staff role.
+  it.each([
+    [UserRole.CUSTOMER, 403],
+    [UserRole.BUSINESS_OWNER, 200],
+    [UserRole.SUPPORT, 403],
+    [UserRole.MODERATOR, 403],
+    [UserRole.ADMIN, 403],
+    [UserRole.SUPER_ADMIN, 403],
+  ])('GET /me/businesses (business.manage_own) as %s → %s', async (role, status) => {
+    expect(await call('GET', '/me/businesses', role)).toBe(status);
+  });
+
+  // …while staff keep administering other owners' listings through /admin
+  // with the explicit platform capability `business.edit_any`.
+  it.each([
+    [UserRole.CUSTOMER, 403],
+    [UserRole.BUSINESS_OWNER, 403],
+    [UserRole.SUPPORT, 403],
+    [UserRole.MODERATOR, 403],
+    [UserRole.ADMIN, 200],
+    [UserRole.SUPER_ADMIN, 200],
+  ])('PATCH /admin/businesses/:id (business.edit_any) as %s → %s', async (role, status) => {
+    expect(await call('PATCH', '/admin/businesses/5', role, { name: 'X', reason: 'e2e' })).toBe(status);
   });
 
   it('an authenticated-only route needs a session but no capability', async () => {

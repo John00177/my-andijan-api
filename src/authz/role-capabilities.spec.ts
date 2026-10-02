@@ -12,9 +12,6 @@ const EXPECTED: Record<UserRole, Capability[]> = {
   ADMIN: [
     'review.write',
     'review.report',
-    'business.claim',
-    'business.create',
-    'business.manage_own',
     'business.review',
     'review.moderate',
     'report.resolve',
@@ -31,9 +28,6 @@ const EXPECTED: Record<UserRole, Capability[]> = {
   SUPER_ADMIN: [
     'review.write',
     'review.report',
-    'business.claim',
-    'business.create',
-    'business.manage_own',
     'business.review',
     'review.moderate',
     'report.resolve',
@@ -77,6 +71,32 @@ describe('Role → capability table', () => {
 
   it('SUPPORT holds no staff capability at all (support desk is a later phase)', () => {
     expect([...ROLE_CAPABILITIES.SUPPORT].sort()).toEqual(['review.report', 'review.write']);
+  });
+
+  // Phase 15D.2: ownership authority and platform authority are separate.
+  it('BUSINESS_OWNER holds every business-owner capability', () => {
+    for (const cap of OWNER_CAPS) expect(hasCapability(UserRole.BUSINESS_OWNER, cap)).toBe(true);
+  });
+
+  it.each([UserRole.ADMIN, UserRole.SUPER_ADMIN])(
+    '%s holds NO business-owner capability but keeps platform business administration (business.edit_any)',
+    (role) => {
+      for (const cap of OWNER_CAPS) expect(hasCapability(role, cap)).toBe(false);
+      expect(capabilitiesFor(role)).not.toEqual(expect.arrayContaining(['business.manage_own']));
+      expect(hasCapability(role, 'business.edit_any')).toBe(true);
+      expect(hasCapability(role, 'business.operate')).toBe(true);
+    },
+  );
+
+  it('no platform staff role holds any business-owner capability', () => {
+    for (const role of [UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN]) {
+      for (const cap of OWNER_CAPS) expect({ role, cap, held: hasCapability(role, cap) }).toEqual({ role, cap, held: false });
+    }
+  });
+
+  it('BUSINESS_OWNER holds no platform capability', () => {
+    expect([...ROLE_CAPABILITIES.BUSINESS_OWNER].sort()).toEqual([...EXPECTED.BUSINESS_OWNER].sort());
+    expect(hasCapability(UserRole.BUSINESS_OWNER, 'business.edit_any')).toBe(false);
   });
 
   it('MODERATOR ≠ ADMIN: MODERATOR holds moderation only', () => {

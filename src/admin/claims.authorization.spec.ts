@@ -49,8 +49,8 @@ describe('Claim route authorization', () => {
       }
     });
 
-    it('is open to the roles that may own a business, closed to SUPPORT and MODERATOR', () => {
-      const allowed: UserRole[] = [UserRole.CUSTOMER, UserRole.BUSINESS_OWNER, UserRole.ADMIN, UserRole.SUPER_ADMIN];
+    it('is open to CUSTOMER and BUSINESS_OWNER only — closed to SUPPORT and all platform staff (D-75, 15D.2)', () => {
+      const allowed: UserRole[] = [UserRole.CUSTOMER, UserRole.BUSINESS_OWNER];
       for (const handler of handlers) {
         const rule = ruleOf(OwnerController, handler);
         for (const role of ROLES) {
