@@ -12,10 +12,12 @@ export interface JwtPayload {
   // users.sessionVersion at issue time. Optional only because tokens minted
   // before Phase 15B lack it; those count as version 0.
   sv?: number;
-  // The AuthSession this token was issued for (Phase 15E.4d.1). Every token
-  // AuthService issues carries it. Optional only while access tokens issued
-  // before 15E.4d.1 can still be unexpired; 15E.4d.2 makes it mandatory.
-  sid?: number;
+  // The AuthSession this token was issued for (Phase 15E.4d.1), mandatory
+  // since Phase 15E.4d.2: every token AuthService issues carries it, and a
+  // token without a valid one is refused. Required here because that is the
+  // invariant for every token we sign. A decoded payload is still untrusted
+  // input, so JwtStrategy re-checks its presence and shape at runtime.
+  sid: number;
 }
 
 export interface AuthenticatedUser {
@@ -60,13 +62,14 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException();
     }
 
-    // Session binding (Phase 15E.4d.1): a token that names its session is
-    // only good while that session is — so logout, refresh-token reuse
-    // revocation and the absolute expiry end it at once. A token without
-    // `sid` predates 15E.4d.1 and keeps the checks above until it expires.
-    if (payload.sid !== undefined) {
-      await this.assertSessionActive(payload.sid, user.id);
-    }
+    // Session binding — mandatory since Phase 15E.4d.2. A token is only good
+    // while the session it names is, so logout, refresh-token reuse
+    // revocation and the absolute expiry end it at once. A token with no
+    // valid `sid` (absent, null, malformed) is refused with the same bare
+    // 401; the 15E.4d.1 compatibility path for pre-`sid` tokens is gone —
+    // the longest-lived of them expired one access-token lifetime after
+    // 15E.4d.1 went live.
+    await this.assertSessionActive(payload.sid, user.id);
 
     setRequestActorRole(user.role);
     return { id: user.id, phone: user.phone, role: user.role };
