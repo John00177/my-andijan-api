@@ -1,4 +1,9 @@
-import { isWithinRefreshGraceWindow, MAX_CLOCK_SKEW_MS, REFRESH_GRACE_WINDOW_MS } from './refresh-sessions';
+import {
+  classifyRotatedPresentation,
+  isWithinRefreshGraceWindow,
+  MAX_CLOCK_SKEW_MS,
+  REFRESH_GRACE_WINDOW_MS,
+} from './refresh-sessions';
 
 // The grace window (Phase 15E.4b): bounded at REFRESH_GRACE_WINDOW_MS into the
 // past and at MAX_CLOCK_SKEW_MS into the future, and only while the successor
@@ -46,5 +51,42 @@ describe('isWithinRefreshGraceWindow', () => {
 
   it('a token that was never rotated → false', () => {
     expect(isWithinRefreshGraceWindow({ rotatedAt: null }, unused, now)).toBe(false);
+  });
+});
+
+// Phase 15E.4c — what /auth/refresh does with a token that failed its
+// compare-and-set (evaluated under the session lock on fresh state).
+describe('classifyRotatedPresentation', () => {
+  const now = new Date('2026-10-02T12:00:00.000Z');
+  const rotated = (offsetMs: number) => ({ rotatedAt: new Date(now.getTime() + offsetMs) });
+  const unused = { rotatedAt: null };
+  const used = { rotatedAt: new Date(now.getTime() - 1) };
+
+  it('a token never rotated (expired or revoked) is not reuse', () => {
+    expect(classifyRotatedPresentation({ rotatedAt: null }, null, now)).toBe('not-rotated');
+    expect(classifyRotatedPresentation({ rotatedAt: null }, unused, now)).toBe('not-rotated');
+  });
+
+  it('inside the window with the successor unused → benign race (boundaries inclusive)', () => {
+    for (const offset of [0, -1, -REFRESH_GRACE_WINDOW_MS, 1, MAX_CLOCK_SKEW_MS]) {
+      expect(classifyRotatedPresentation(rotated(offset), unused, now)).toBe('benign-race');
+    }
+  });
+
+  it('just outside either edge of the window → reuse', () => {
+    expect(classifyRotatedPresentation(rotated(-REFRESH_GRACE_WINDOW_MS - 1), unused, now)).toBe('reuse');
+    expect(classifyRotatedPresentation(rotated(MAX_CLOCK_SKEW_MS + 1), unused, now)).toBe('reuse');
+    expect(classifyRotatedPresentation(rotated(-24 * 60 * 60 * 1000), unused, now)).toBe('reuse');
+  });
+
+  it('successor already used → reuse, even inside the window', () => {
+    for (const offset of [0, -1_000, -REFRESH_GRACE_WINDOW_MS, MAX_CLOCK_SKEW_MS]) {
+      expect(classifyRotatedPresentation(rotated(offset), used, now)).toBe('reuse');
+    }
+  });
+
+  it('no successor row (only after a future cleanup) → judged by age alone', () => {
+    expect(classifyRotatedPresentation(rotated(-1_000), null, now)).toBe('benign-race');
+    expect(classifyRotatedPresentation(rotated(-REFRESH_GRACE_WINDOW_MS - 1), null, now)).toBe('reuse');
   });
 });

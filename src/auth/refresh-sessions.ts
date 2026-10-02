@@ -78,10 +78,12 @@ export function sessionDeviceMetadata(): { userAgent: string | null; ipAddress: 
 /**
  * Was this already-rotated token presented again within the grace window,
  * before its successor was ever used? True = indistinguishable from a benign
- * client race; false = possible reuse. In 15E.4b refresh never revokes on
- * either answer — a rotated token simply gets the generic 401 (15E.4c builds
- * on this). Logout uses it: a token inside the window may still end its own
- * session, because that is a client signing out mid-refresh.
+ * client race; false = reuse. Two callers, two meanings:
+ *   - refresh (15E.4c): true only spares the session from reuse revocation —
+ *     the token is still refused with the generic 401 and never yields a
+ *     successor (see classifyRotatedPresentation);
+ *   - logout (15E.4b): true lets the token still end its own session, because
+ *     that is a client signing out mid-refresh.
  */
 export function isWithinRefreshGraceWindow(
   token: { rotatedAt: Date | null },
@@ -97,7 +99,53 @@ export function isWithinRefreshGraceWindow(
   );
 }
 
+/**
+ * What a refresh that failed its compare-and-set was presented (Phase 15E.4c).
+ * Evaluate it on state re-read under the session lock and on a clock read
+ * after that re-read.
+ *   - 'not-rotated': expired or revoked without ever being rotated — not reuse;
+ *   - 'benign-race': rotated inside the grace window, successor unused — the
+ *     same client racing its own rotation; refused, session left alone;
+ *   - 'reuse': any other rotated token — older than the window, stamped beyond
+ *     the clock-skew tolerance, or with its successor already used. Expiry does
+ *     not change this: a rotated token is a copy whether or not it has expired.
+ */
+export type RotatedPresentation = 'not-rotated' | 'benign-race' | 'reuse';
+
+export function classifyRotatedPresentation(
+  token: { rotatedAt: Date | null },
+  successor: { rotatedAt: Date | null } | null,
+  now: Date,
+): RotatedPresentation {
+  if (!token.rotatedAt) return 'not-rotated';
+  return isWithinRefreshGraceWindow(token, successor, now) ? 'benign-race' : 'reuse';
+}
+
 type SessionClient = Pick<Prisma.TransactionClient, 'authSession' | 'refreshToken'>;
+
+/**
+ * Ends ONE session after refresh-token reuse (Phase 15E.4c): the session
+ * (REUSE_DETECTED) and then every one of its tokens, in a fresh statement
+ * snapshot that includes any successor committed before we took the lock.
+ * The caller must already hold that session's row lock. Other sessions of the
+ * user and the user's sessionVersion are deliberately left alone.
+ */
+export async function revokeSessionForReuse(
+  tx: SessionClient,
+  sessionId: number,
+  now: Date,
+): Promise<{ sessionRevoked: boolean; tokensRevoked: number }> {
+  const session = await tx.authSession.updateMany({
+    where: { id: sessionId, revokedAt: null },
+    data: { revokedAt: now, revokedReason: SessionRevokedReason.REUSE_DETECTED },
+  });
+  if (session.count !== 1) return { sessionRevoked: false, tokensRevoked: 0 };
+  const tokens = await tx.refreshToken.updateMany({
+    where: { sessionId, revokedAt: null },
+    data: { revokedAt: now },
+  });
+  return { sessionRevoked: true, tokensRevoked: tokens.count };
+}
 
 /**
  * Ends every session of one user (password reset, suspension). Call it inside
