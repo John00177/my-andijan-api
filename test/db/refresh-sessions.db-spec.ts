@@ -365,7 +365,7 @@ describe('Refresh-token sessions on PostgreSQL (Phase 15E.4b)', () => {
     expect(await prisma.refreshToken.count()).toBe(before);
     const r1 = await tokenRow(r1Raw);
     const session = await prisma.authSession.findUniqueOrThrow({ where: { id: r1.sessionId! } });
-    expect(session.revokedAt).toBeNull(); // 15E.4b never revokes on reuse — that is 15E.4c
+    expect(session.revokedAt).toBeNull(); // inside the grace window, successor unused: a harmless race, not reuse (15E.4c)
 
     // The grace-window inputs: when R1 was rotated, and whether its successor was used.
     const successor = await prisma.refreshToken.findUniqueOrThrow({ where: { parentId: r1.id } });
@@ -648,7 +648,7 @@ describe('Refresh-token sessions on PostgreSQL (Phase 15E.4b)', () => {
       }
     });
 
-    it('a rotated token whose successor was already used ends nothing; reuse semantics are unchanged', async () => {
+    it('logout with a rotated token whose successor was already used ends nothing; refresh with it is reuse (15E.4c)', async () => {
       const { refreshToken: r1 } = await signIn();
       const { refreshToken: r2 } = await refresh(r1);
       const { refreshToken: r3 } = await refresh(r2); // the successor of R1 is used
@@ -656,12 +656,13 @@ describe('Refresh-token sessions on PostgreSQL (Phase 15E.4b)', () => {
       await expect(auth.logout(r1)).resolves.toEqual({ success: true });
 
       const session = await prisma.authSession.findFirstOrThrow();
-      expect(session.revokedAt).toBeNull();
+      expect(session.revokedAt).toBeNull(); // stale-token logout stays a no-op
       expect(await prisma.auditLog.count({ where: { entityType: 'AuthSession' } })).toBe(0);
-      // Refresh still refuses the old token with the generic 401 and revokes nothing (15E.4b).
-      await expect(refresh(r1)).rejects.toThrow('Invalid or expired refresh token');
-      expect((await prisma.authSession.findFirstOrThrow()).revokedAt).toBeNull();
       await expect(refresh(r3)).resolves.toBeDefined();
+
+      // The same stale token at /auth/refresh: generic 401, and this session is revoked for reuse.
+      await expect(refresh(r1)).rejects.toThrow('Invalid or expired refresh token');
+      expect((await prisma.authSession.findFirstOrThrow()).revokedReason).toBe(SessionRevokedReason.REUSE_DETECTED);
     });
 
     it("a rotation stamped slightly ahead of logout's clock (another request's or replica's clock) still counts as recent", async () => {

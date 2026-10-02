@@ -27,14 +27,16 @@ import { UpdateProfileDto } from './dto/update-profile.dto';
 import { SmsService } from '../sms/sms.service';
 import { UploadService } from '../upload/upload.service';
 import { JwtPayload } from './strategies/jwt.strategy';
-import { auditRequestFields } from '../common/request-context/request-context';
+import { auditRequestFields, getRequestContext } from '../common/request-context/request-context';
 import { capabilitiesFor } from '../authz/capabilities';
 import {
   ABSOLUTE_SESSION_TTL_MS,
+  classifyRotatedPresentation,
   isWithinRefreshGraceWindow,
   legacySessionExpiry,
   refreshTokenExpiry,
   revokeAllUserSessions,
+  revokeSessionForReuse,
   sessionDeviceMetadata,
 } from './refresh-sessions';
 
@@ -72,8 +74,21 @@ interface TokenPair {
 
 type SessionUser = Pick<User, 'id' | 'phone' | 'role' | 'sessionVersion'>;
 
-/** Thrown inside a refresh transaction to roll ALL of it back; becomes the generic 401. */
-class RefreshRejected extends Error {}
+/**
+ * Thrown inside a refresh transaction to roll ALL of it back; becomes the
+ * generic 401. `race` marks a harmless grace-window race (15E.4c), logged with
+ * IDs only after the rollback.
+ */
+class RefreshRejected extends Error {
+  constructor(readonly race?: { sessionId: number; tokenId: number }) {
+    super();
+  }
+}
+
+/** A rotation that committed: the one successor. */
+type Rotated = { kind: 'rotated'; user: User; refreshToken: string };
+/** Reuse that committed its session revocation (15E.4c); still the generic 401. */
+type ReuseDetected = { kind: 'reuse'; sessionId: number; tokenId: number; userId: number };
 
 /** Thrown inside a logout transaction to roll back a revocation the token is not entitled to. */
 class LogoutNotEntitled extends Error {}
@@ -189,32 +204,50 @@ export class AuthService {
   }
 
   /**
-   * Race-safe rotation (Phase 15E.4b). One transaction; see
-   * refresh-sessions.ts for the locking model. Of any number of concurrent
-   * requests presenting the same token, exactly one gets a successor; every
-   * other one gets the generic 401 and changes nothing.
+   * Race-safe rotation (Phase 15E.4b) with reuse detection (Phase 15E.4c).
+   * One transaction; see refresh-sessions.ts for the locking model. Of any
+   * number of concurrent requests presenting the same token, exactly one gets
+   * a successor.
    *
-   * A token that was already rotated is refused with that same 401 and
-   * nothing else happens: revoking the session on reuse is Phase 15E.4c.
+   * A token that was already rotated NEVER yields a successor. While its
+   * session is live it is classified under the session lock:
+   *   - harmless race (inside the grace window, successor unused): 401, the
+   *     session is left alone, everything rolls back;
+   *   - reuse (anything else): this session and all its tokens are revoked
+   *     (REUSE_DETECTED) and audited — committed — then the same 401.
+   * Every failure answers identically, so the caller cannot tell reuse from
+   * expiry, revocation or an unknown token.
    */
   async refresh(dto: RefreshDto) {
     const tokenHash = this.hashToken(dto.refreshToken);
-    let rotated: { user: User; refreshToken: string };
+    let outcome: Rotated | ReuseDetected;
     try {
-      rotated = await this.prisma.$transaction((tx) => this.rotateRefreshToken(tx, tokenHash));
+      outcome = await this.prisma.$transaction((tx) => this.rotateRefreshToken(tx, tokenHash));
     } catch (error) {
-      // P2002 is the parent_id UNIQUE backstop refusing a second successor —
-      // unreachable while the locking below is correct, and a plain 401 if not.
-      if (error instanceof RefreshRejected || isUniqueViolation(error)) {
+      if (error instanceof RefreshRejected) {
+        if (error.race) {
+          this.logger.log(
+            `Refresh grace-window race refused (session=${error.race.sessionId} token=${error.race.tokenId} request=${requestIdForLog()})`,
+          );
+        }
         throw new UnauthorizedException(INVALID_REFRESH_MESSAGE);
       }
+      // P2002 is the parent_id UNIQUE backstop refusing a second successor —
+      // unreachable while the locking below is correct, and a plain 401 if not.
+      if (isUniqueViolation(error)) throw new UnauthorizedException(INVALID_REFRESH_MESSAGE);
       throw error;
     }
-    const accessToken = await this.signAccessToken(rotated.user);
-    return { user: this.sanitizeUser(rotated.user), accessToken, refreshToken: rotated.refreshToken };
+    if (outcome.kind === 'reuse') {
+      this.logger.warn(
+        `Refresh-token reuse detected; session revoked (session=${outcome.sessionId} token=${outcome.tokenId} user=${outcome.userId} request=${requestIdForLog()})`,
+      );
+      throw new UnauthorizedException(INVALID_REFRESH_MESSAGE);
+    }
+    const accessToken = await this.signAccessToken(outcome.user);
+    return { user: this.sanitizeUser(outcome.user), accessToken, refreshToken: outcome.refreshToken };
   }
 
-  private async rotateRefreshToken(tx: Prisma.TransactionClient, tokenHash: string) {
+  private async rotateRefreshToken(tx: Prisma.TransactionClient, tokenHash: string): Promise<Rotated | ReuseDetected> {
     const now = new Date();
 
     // 1. Locate the token. No lock yet: this read decides only which session
@@ -249,7 +282,11 @@ export class AuthService {
       where: { id: presented.id, sessionId, rotatedAt: null, revokedAt: null, expiresAt: { gt: now } },
       data: { rotatedAt: now, revokedAt: now },
     });
-    if (cas.count !== 1) throw new RefreshRejected();
+    if (cas.count !== 1) {
+      // Not the current token. Still holding the session lock (the session is
+      // live): rotated → harmless race or reuse; otherwise plain refusal.
+      return this.handleRotatedPresentation(tx, presented.id, sessionId, session.userId, now);
+    }
 
     // 4. The account must still be usable. Rejecting here rolls the rotation back.
     const user = await tx.user.findUnique({ where: { id: session.userId } });
@@ -267,7 +304,60 @@ export class AuthService {
         expiresAt: refreshTokenExpiry(now, this.refreshTtlMs(), session.absoluteExpiresAt),
       },
     });
-    return { user, refreshToken };
+    return { kind: 'rotated', user, refreshToken };
+  }
+
+  /**
+   * Reuse detection (Phase 15E.4c). Runs only after the compare-and-set
+   * failed, while this transaction holds the live session's row lock — so
+   * every other writer of the session (rotation of the successor, logout,
+   * another detection, password reset, suspension) is serialized with it.
+   * The token is re-read in a fresh statement and judged on a clock read
+   * AFTER that re-read (a rotation that just committed was stamped by another
+   * request's clock).
+   */
+  private async handleRotatedPresentation(
+    tx: Prisma.TransactionClient,
+    tokenId: number,
+    sessionId: number,
+    userId: number,
+    now: Date,
+  ): Promise<ReuseDetected> {
+    const token = await tx.refreshToken.findUniqueOrThrow({
+      where: { id: tokenId },
+      select: { rotatedAt: true, successor: { select: { rotatedAt: true } } },
+    });
+    const checkedAt = new Date();
+    const verdict = classifyRotatedPresentation(token, token.successor, checkedAt);
+    if (verdict === 'not-rotated') throw new RefreshRejected(); // expired or revoked: not reuse
+    if (verdict === 'benign-race') throw new RefreshRejected({ sessionId, tokenId }); // rolls back, session untouched
+
+    // Reuse: end this session — never another one, never sessionVersion — and
+    // commit that, then answer with the same 401 as any failure.
+    const revoked = await revokeSessionForReuse(tx, sessionId, now);
+    if (!revoked.sessionRevoked) throw new RefreshRejected(); // unreachable: we hold the live session's lock
+    const owner = await tx.user.findUnique({ where: { id: userId }, select: { role: true } });
+    await tx.auditLog.create({
+      data: {
+        ...auditRequestFields(),
+        actorId: userId,
+        actorRole: owner?.role ?? null,
+        action: AuditAction.UPDATE,
+        entityType: 'AuthSession',
+        entityId: sessionId,
+        before: { revoked: false } as Prisma.InputJsonValue,
+        after: {
+          revoked: true,
+          reason: SessionRevokedReason.REUSE_DETECTED,
+          tokensRevoked: revoked.tokensRevoked,
+          presentedTokenId: tokenId,
+          successorUsed: Boolean(token.successor?.rotatedAt),
+          rotatedAgoMs: checkedAt.getTime() - token.rotatedAt!.getTime(),
+        } as Prisma.InputJsonValue,
+        note: 'Refresh-token reuse detected — session revoked',
+      },
+    });
+    return { kind: 'reuse', sessionId, tokenId, userId };
   }
 
   /**
@@ -804,4 +894,9 @@ export class AuthService {
 
 function isUniqueViolation(error: unknown): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
+}
+
+/** The server-generated request id, for log lines (never the token, hash, IP or user agent). */
+function requestIdForLog(): string {
+  return getRequestContext()?.requestId ?? '-';
 }
