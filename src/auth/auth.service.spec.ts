@@ -3,6 +3,7 @@ import { Test } from '@nestjs/testing';
 import { JwtService } from '@nestjs/jwt';
 import { UserRole, UserStatus } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
+import { createHash } from 'crypto';
 import { AuthService } from './auth.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { SmsService } from '../sms/sms.service';
@@ -14,7 +15,7 @@ describe('AuthService.login', () => {
   let service: AuthService;
   let prisma: {
     user: { findUnique: jest.Mock; update: jest.Mock };
-    refreshToken: { create: jest.Mock };
+    authSession: { create: jest.Mock };
   };
 
   const baseUser = {
@@ -32,7 +33,7 @@ describe('AuthService.login', () => {
   beforeEach(async () => {
     prisma = {
       user: { findUnique: jest.fn(), update: jest.fn() },
-      refreshToken: { create: jest.fn().mockResolvedValue({}) },
+      authSession: { create: jest.fn().mockResolvedValue({ id: 1 }) },
     };
 
     const moduleRef = await Test.createTestingModule({
@@ -91,8 +92,33 @@ describe('AuthService.login', () => {
 
     expect(result.user).not.toHaveProperty('passwordHash');
     expect(result.accessToken).toBe('signed-jwt');
-    expect(typeof result.refreshToken).toBe('string');
-    expect(prisma.refreshToken.create).toHaveBeenCalledTimes(1);
+    expect(/^[0-9a-f]{96}$/.test(result.refreshToken)).toBe(true);
+    expect(prisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: baseUser.id } }),
+    );
+  });
+
+  it('one sign-in = exactly one AuthSession (90-day absolute expiry) holding its first token, stored as SHA-256 only', async () => {
+    prisma.user.findUnique.mockResolvedValue(baseUser);
+    prisma.user.update.mockResolvedValue({ ...baseUser, lastLoginAt: new Date() });
+    (bcrypt.compare as jest.Mock).mockResolvedValue(true);
+
+    const before = Date.now();
+    const result = await service.login({ phone: baseUser.phone, password: 'correct' });
+
+    expect(prisma.authSession.create).toHaveBeenCalledTimes(1);
+    const { data } = prisma.authSession.create.mock.calls[0][0];
+    expect(data.userId).toBe(baseUser.id);
+    const lifetime = data.absoluteExpiresAt.getTime() - data.createdAt.getTime();
+    expect(lifetime).toBe(90 * 24 * 60 * 60 * 1000);
+    expect(data.createdAt.getTime()).toBeGreaterThanOrEqual(before);
+
+    const token = data.refreshTokens.create;
+    expect(token.userId).toBe(baseUser.id);
+    expect(token.tokenHash).toBe(createHash('sha256').update(result.refreshToken).digest('hex'));
+    expect(token.expiresAt.getTime()).toBeLessThanOrEqual(data.absoluteExpiresAt.getTime());
+    // The raw token is never written anywhere.
+    expect(JSON.stringify(prisma.authSession.create.mock.calls).includes(result.refreshToken)).toBe(false);
     expect(prisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({ where: { id: baseUser.id } }),
     );

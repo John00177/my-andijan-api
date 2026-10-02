@@ -18,6 +18,25 @@ jobs:
   # branch ruleset) refer to.
   test-and-build:
     runs-on: ubuntu-latest
+    # Throwaway PostgreSQL for the database suites (Phase 15E.4b): the
+    # refresh-token concurrency invariants can only be proven against a real
+    # database. It lives and dies with this job, is reachable only from the
+    # runner, and holds no data but what the tests create — so it uses trust
+    # authentication and needs no credential at all. Pinned by digest
+    # (postgres:16-alpine, multi-arch index).
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: myandijan_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d myandijan_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       # Actions are pinned to full commit SHAs (immutable — a moved or
       # compromised tag cannot change what runs in the gate); the comment
@@ -36,6 +55,14 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      # Real-PostgreSQL suites: migrations deploy on an empty database and on
+      # pre-15E.4b data; concurrent refreshes of one token yield exactly one
+      # successor. test/db/support.ts refuses any non-local or non-test database.
+      - name: Run database tests
+        run: npm run test:db
+        env:
+          TEST_DATABASE_URL: postgresql://postgres@localhost:5432/myandijan_test
 
       - name: Build
         run: npm run build

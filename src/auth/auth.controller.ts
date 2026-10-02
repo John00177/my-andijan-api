@@ -33,7 +33,7 @@ import { Public, Authenticated } from '../authz/authz.decorators';
 
 // Every credential / SMS-code route is rate limited (Phase 15B) — per client
 // address and per target phone; limits and rationale in auth-throttle.ts.
-// Exceeding one returns 429. Authenticated profile/logout calls are exempt.
+// Exceeding one returns 429. The authenticated profile call is exempt.
 @ApiTags('auth')
 @UseGuards(ThrottlerGuard)
 @Controller('auth')
@@ -65,12 +65,16 @@ export class AuthController {
     return this.authService.refresh(dto);
   }
 
-  @SkipThrottle({ ip: true, phone: true })
-  @ApiBearerAuth()
+  // Phase 15E.4b: public — possession of the session's current refresh token
+  // is the proof, so sign-out still works once the access token has expired.
+  // Ends that whole session; always { success: true }, whatever the token.
+  // Per-address bucket only, like refresh.
+  @Throttle(AUTH_LIMITS.logout)
+  @SkipThrottle({ phone: true })
   @HttpCode(HttpStatus.OK)
-  @Authenticated()
+  @Public()
   @Post('logout')
-  logout(@Body() dto: RefreshDto, @CurrentUser() _user: AuthenticatedUser) {
+  logout(@Body() dto: RefreshDto) {
     return this.authService.logout(dto.refreshToken);
   }
 

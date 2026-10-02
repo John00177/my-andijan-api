@@ -1,6 +1,6 @@
 import { ConflictException, ForbiddenException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { AuditAction, UserRole, UserStatus } from '@prisma/client';
+import { AuditAction, SessionRevokedReason, UserRole, UserStatus } from '@prisma/client';
 import { AdminService } from './admin.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReviewsService } from '../reviews/reviews.service';
@@ -95,6 +95,7 @@ describe('AdminService.suspendUser / activateUser (Phase 15B)', () => {
     $transaction: jest.Mock;
     user: { findFirst: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock };
     refreshToken: { updateMany: jest.Mock };
+    authSession: { updateMany: jest.Mock };
     auditLog: { create: jest.Mock };
   };
 
@@ -113,7 +114,9 @@ describe('AdminService.suspendUser / activateUser (Phase 15B)', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         findUniqueOrThrow: jest.fn(),
       },
-      refreshToken: { updateMany: jest.fn().mockResolvedValue({ count: 3 }) },
+      // Session-less legacy tokens first (none here), then every token.
+      refreshToken: { updateMany: jest.fn().mockResolvedValueOnce({ count: 0 }).mockResolvedValue({ count: 3 }) },
+      authSession: { updateMany: jest.fn().mockResolvedValue({ count: 2 }) },
       auditLog: { create: jest.fn() },
     };
     const moduleRef = await Test.createTestingModule({
@@ -126,7 +129,7 @@ describe('AdminService.suspendUser / activateUser (Phase 15B)', () => {
     service = moduleRef.get(AdminService);
   });
 
-  it('suspends with compare-and-set on status AND role, bumps sessionVersion and revokes every refresh token', async () => {
+  it('suspends with compare-and-set on status AND role, bumps sessionVersion and revokes every session and refresh token', async () => {
     prisma.user.findFirst.mockResolvedValue(targetRow(UserRole.CUSTOMER));
     prisma.user.findUniqueOrThrow.mockResolvedValue({ ...targetRow(UserRole.CUSTOMER), status: UserStatus.SUSPENDED });
 
@@ -135,6 +138,14 @@ describe('AdminService.suspendUser / activateUser (Phase 15B)', () => {
     expect(prisma.user.updateMany).toHaveBeenCalledWith({
       where: { id: 2, status: UserStatus.ACTIVE, role: UserRole.CUSTOMER, deletedAt: null },
       data: { status: UserStatus.SUSPENDED, sessionVersion: { increment: 1 } },
+    });
+    expect(prisma.authSession.updateMany).toHaveBeenCalledWith({
+      where: { userId: 2, revokedAt: null },
+      data: { revokedAt: expect.any(Date), revokedReason: SessionRevokedReason.SUSPENDED },
+    });
+    expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+      where: { userId: 2, sessionId: null, revokedAt: null },
+      data: { revokedAt: expect.any(Date) },
     });
     expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
       where: { userId: 2, revokedAt: null },
@@ -147,7 +158,7 @@ describe('AdminService.suspendUser / activateUser (Phase 15B)', () => {
         entityType: 'User',
         entityId: 2,
         note: 'Spam accounts',
-        after: expect.objectContaining({ kind: 'SUSPENSION', sessionsRevoked: 3 }),
+        after: expect.objectContaining({ kind: 'SUSPENSION', sessionsRevoked: 2, tokensRevoked: 3 }),
       }),
     });
     expect(result).not.toHaveProperty('passwordHash');
@@ -170,6 +181,7 @@ describe('AdminService.suspendUser / activateUser (Phase 15B)', () => {
     await expect(service.suspendUser(2, admin, 'x')).rejects.toThrow(ForbiddenException);
     expect(prisma.user.updateMany).not.toHaveBeenCalled();
     expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
+    expect(prisma.authSession.updateMany).not.toHaveBeenCalled();
     expect(prisma.auditLog.create).not.toHaveBeenCalled();
   });
 
@@ -197,6 +209,7 @@ describe('AdminService.suspendUser / activateUser (Phase 15B)', () => {
 
     await expect(service.suspendUser(2, admin, 'x')).rejects.toThrow(ConflictException);
     expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
+    expect(prisma.authSession.updateMany).not.toHaveBeenCalled();
     expect(prisma.auditLog.create).not.toHaveBeenCalled();
   });
 
@@ -216,6 +229,9 @@ describe('AdminService.suspendUser / activateUser (Phase 15B)', () => {
       where: { id: 2, status: UserStatus.SUSPENDED, role: UserRole.MODERATOR, deletedAt: null },
       data: { status: UserStatus.ACTIVE },
     });
+    // Reinstatement revives nothing: no session or token is touched.
+    expect(prisma.authSession.updateMany).not.toHaveBeenCalled();
+    expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ action: AuditAction.RESTORE, note: 'Investigation closed' }),
     });

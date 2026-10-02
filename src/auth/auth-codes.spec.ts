@@ -51,6 +51,7 @@ type User = {
   sessionVersion: number;
   deletedAt: Date | null;
 };
+type Session = { id: number; userId: number; revokedAt: Date | null; revokedReason: string | null };
 type Where = Record<string, any>;
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -78,7 +79,8 @@ function otpMatches(o: Otp, w: Where): boolean {
 function createDb() {
   const users: User[] = [];
   const otps: Otp[] = [];
-  const tokens: Array<{ id: number; userId: number; revokedAt: Date | null }> = [];
+  const tokens: Array<{ id: number; userId: number; sessionId: number | null; revokedAt: Date | null }> = [];
+  const sessions: Session[] = [];
   const audit: Array<Record<string, any>> = [];
   const findUser = (w: Where) => users.find((u) => (w.id !== undefined ? u.id === w.id : u.phone === w.phone));
 
@@ -86,6 +88,7 @@ function createDb() {
     users,
     otps,
     tokens,
+    sessions,
     audit,
     user: {
       findUnique: async ({ where }: { where: Where }) => (await tick(), findUser(where) ?? null),
@@ -129,13 +132,32 @@ function createDb() {
         return { count: hit.length };
       },
     },
-    refreshToken: {
-      create: async ({ data }: { data: { userId: number } }) => {
-        tokens.push({ id: tokens.length + 1, revokedAt: null, ...data });
-        return {};
+    // Sign-in writes one AuthSession with its first token nested (15E.4b);
+    // user-wide revocation updates both tables by userId.
+    authSession: {
+      create: async ({ data }: { data: Record<string, any> }) => {
+        const { refreshTokens, ...session } = data;
+        const row = { id: sessions.length + 1, revokedAt: null, revokedReason: null, ...session } as Session;
+        sessions.push(row);
+        if (refreshTokens?.create) {
+          tokens.push({ id: tokens.length + 1, sessionId: row.id, revokedAt: null, ...refreshTokens.create });
+        }
+        return { id: row.id };
       },
       updateMany: async ({ where, data }: { where: Where; data: Record<string, any> }) => {
-        const hit = tokens.filter((t) => t.userId === where.userId && t.revokedAt === null);
+        const hit = sessions.filter((s) => s.userId === where.userId && s.revokedAt === null);
+        hit.forEach((s) => apply(s, data));
+        return { count: hit.length };
+      },
+    },
+    refreshToken: {
+      updateMany: async ({ where, data }: { where: Where; data: Record<string, any> }) => {
+        const hit = tokens.filter(
+          (t) =>
+            t.userId === where.userId &&
+            t.revokedAt === null &&
+            (where.sessionId === undefined || t.sessionId === where.sessionId),
+        );
         hit.forEach((t) => apply(t, data));
         return { count: hit.length };
       },
@@ -386,6 +408,7 @@ describe('Authentication codes (Phase 15E.2)', () => {
       const otp = codeFromSms();
       const results = await Promise.allSettled([auth.verifyOtp({ phone: PHONE, otp }), auth.verifyOtp({ phone: PHONE, otp })]);
       expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      expect(db.sessions).toHaveLength(1);
       expect(db.tokens).toHaveLength(1);
     });
   });
@@ -413,6 +436,7 @@ describe('Authentication codes (Phase 15E.2)', () => {
       const body = JSON.stringify(error.getResponse());
       for (const name of [...STAFF, 'staff', 'role']) expect(body.toLowerCase()).not.toContain(name.toLowerCase());
       expect(db.otps[0].usedAt).not.toBeNull();
+      expect(db.sessions).toHaveLength(0);
       expect(db.tokens).toHaveLength(0);
     });
   });
@@ -446,8 +470,12 @@ describe('Authentication codes (Phase 15E.2)', () => {
       expect(user.sessionVersion).toBe(1);
       expect(user.passwordHash).toBe('h:new-password-1');
       expect(db.tokens.every((t) => t.revokedAt !== null)).toBe(true);
+      expect(db.sessions.every((s) => s.revokedAt !== null && s.revokedReason === 'PASSWORD_RESET')).toBe(true);
       expect(db.audit).toContainEqual(
-        expect.objectContaining({ entityType: 'UserCredentials', after: { passwordReset: true, sessionsRevoked: 2 } }),
+        expect.objectContaining({
+          entityType: 'UserCredentials',
+          after: { passwordReset: true, sessionsRevoked: 2, tokensRevoked: 2 },
+        }),
       );
     });
   });

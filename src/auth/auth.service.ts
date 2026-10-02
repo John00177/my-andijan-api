@@ -11,7 +11,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { AuditAction, OtpCode, OtpPurpose, Prisma, UserRole, UserStatus } from '@prisma/client';
+import { AuditAction, OtpCode, OtpPurpose, Prisma, SessionRevokedReason, User, UserRole, UserStatus } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -29,6 +29,13 @@ import { UploadService } from '../upload/upload.service';
 import { JwtPayload } from './strategies/jwt.strategy';
 import { auditRequestFields } from '../common/request-context/request-context';
 import { capabilitiesFor } from '../authz/capabilities';
+import {
+  ABSOLUTE_SESSION_TTL_MS,
+  legacySessionExpiry,
+  refreshTokenExpiry,
+  revokeAllUserSessions,
+  sessionDeviceMetadata,
+} from './refresh-sessions';
 
 const BCRYPT_ROUNDS = 12;
 const RESET_CODE_TTL_MINUTES = 15;
@@ -52,10 +59,20 @@ const INVALID_RESET_CODE = { valid: false, message: "Noto'g'ri kod", statusCode:
 const OTP_LOGIN_UNAVAILABLE_MESSAGE = "Bu hisobga SMS kod bilan kirib bo'lmaydi. Parol bilan kiring.";
 const SMS_UNAVAILABLE_MESSAGE = "SMS xizmati hozircha ishlamayapti. Keyinroq urinib ko'ring yoki parol bilan kiring.";
 
+// Every refresh failure — unknown, expired, rotated, revoked, lost race,
+// revoked or expired session, inactive user — gets this one 401, so a caller
+// cannot tell a detected replay from an ordinary expiry (Phase 15E.4b).
+const INVALID_REFRESH_MESSAGE = 'Invalid or expired refresh token';
+
 interface TokenPair {
   accessToken: string;
   refreshToken: string;
 }
+
+type SessionUser = Pick<User, 'id' | 'phone' | 'role' | 'sessionVersion'>;
+
+/** Thrown inside a refresh transaction to roll ALL of it back; becomes the generic 401. */
+class RefreshRejected extends Error {}
 
 @Injectable()
 export class AuthService {
@@ -116,7 +133,7 @@ export class AuthService {
       },
     });
 
-    const tokens = await this.issueTokens(user);
+    const tokens = await this.startSession(user);
     return { user: this.sanitizeUser(user), ...tokens };
   }
 
@@ -140,42 +157,187 @@ export class AuthService {
       data: { lastLoginAt: new Date() },
     });
 
-    const tokens = await this.issueTokens(user);
+    const tokens = await this.startSession(user);
     return { user: this.sanitizeUser(user), ...tokens };
   }
 
+  /**
+   * Race-safe rotation (Phase 15E.4b). One transaction; see
+   * refresh-sessions.ts for the locking model. Of any number of concurrent
+   * requests presenting the same token, exactly one gets a successor; every
+   * other one gets the generic 401 and changes nothing.
+   *
+   * A token that was already rotated is refused with that same 401 and
+   * nothing else happens: revoking the session on reuse is Phase 15E.4c.
+   */
   async refresh(dto: RefreshDto) {
     const tokenHash = this.hashToken(dto.refreshToken);
-
-    const stored = await this.prisma.refreshToken.findUnique({
-      where: { tokenHash },
-      include: { user: true },
-    });
-
-    if (!stored || stored.revokedAt || stored.expiresAt < new Date()) {
-      throw new UnauthorizedException('Invalid or expired refresh token');
+    let rotated: { user: User; refreshToken: string };
+    try {
+      rotated = await this.prisma.$transaction((tx) => this.rotateRefreshToken(tx, tokenHash));
+    } catch (error) {
+      // P2002 is the parent_id UNIQUE backstop refusing a second successor —
+      // unreachable while the locking below is correct, and a plain 401 if not.
+      if (error instanceof RefreshRejected || isUniqueViolation(error)) {
+        throw new UnauthorizedException(INVALID_REFRESH_MESSAGE);
+      }
+      throw error;
     }
-
-    if (!stored.user || stored.user.deletedAt || stored.user.status !== UserStatus.ACTIVE) {
-      throw new UnauthorizedException('Invalid or expired refresh token');
-    }
-
-    // Rotate: revoke the used token and issue a brand new pair.
-    await this.prisma.refreshToken.update({
-      where: { id: stored.id },
-      data: { revokedAt: new Date() },
-    });
-
-    const tokens = await this.issueTokens(stored.user);
-    return { user: this.sanitizeUser(stored.user), ...tokens };
+    const accessToken = await this.signAccessToken(rotated.user);
+    return { user: this.sanitizeUser(rotated.user), accessToken, refreshToken: rotated.refreshToken };
   }
 
+  private async rotateRefreshToken(tx: Prisma.TransactionClient, tokenHash: string) {
+    const now = new Date();
+
+    // 1. Locate the token. No lock yet: this read decides only which session
+    //    to lock, never whether to rotate.
+    const presented = await tx.refreshToken.findUnique({
+      where: { tokenHash },
+      select: { id: true, sessionId: true },
+    });
+    if (!presented) throw new RefreshRejected();
+    const sessionId = presented.sessionId ?? (await this.attachLegacySession(tx, presented.id, now));
+
+    // 2. Serialization point: lock the session row. A concurrent refresh,
+    //    logout or revocation of this session waits here until we commit, and
+    //    the condition is re-checked against whatever it committed. Revoked,
+    //    or past its absolute lifetime → refused.
+    const locked = await tx.authSession.updateMany({
+      where: { id: sessionId, revokedAt: null, absoluteExpiresAt: { gt: now } },
+      data: { lastUsedAt: now },
+    });
+    if (locked.count !== 1) throw new RefreshRejected();
+    const session = await tx.authSession.findUniqueOrThrow({
+      where: { id: sessionId },
+      select: { userId: true, absoluteExpiresAt: true },
+    });
+
+    // 3. Compare-and-set on the presented token, under the session lock. Only
+    //    the request that flips rotatedAt from NULL may create a successor;
+    //    for every other one the count is 0. revokedAt is set as well, so a
+    //    rotated token stays dead even to code that predates rotatedAt (the
+    //    previous release during a rolling deploy, or after a rollback).
+    const cas = await tx.refreshToken.updateMany({
+      where: { id: presented.id, sessionId, rotatedAt: null, revokedAt: null, expiresAt: { gt: now } },
+      data: { rotatedAt: now, revokedAt: now },
+    });
+    if (cas.count !== 1) throw new RefreshRejected();
+
+    // 4. The account must still be usable. Rejecting here rolls the rotation back.
+    const user = await tx.user.findUnique({ where: { id: session.userId } });
+    if (!user || user.deletedAt || user.status !== UserStatus.ACTIVE) throw new RefreshRejected();
+
+    // 5. The one successor: same session, linked to its predecessor
+    //    (parent_id UNIQUE), never outliving the session.
+    const refreshToken = this.newRefreshToken();
+    await tx.refreshToken.create({
+      data: {
+        userId: user.id,
+        sessionId,
+        parentId: presented.id,
+        tokenHash: this.hashToken(refreshToken),
+        expiresAt: refreshTokenExpiry(now, this.refreshTtlMs(), session.absoluteExpiresAt),
+      },
+    });
+    return { user, refreshToken };
+  }
+
+  /**
+   * A token issued by the pre-15E.4b code (during the rolling deploy, or not
+   * live at backfill time) has no session. It gets one now, created and linked
+   * inside the refresh transaction; the link is a compare-and-set on
+   * session_id IS NULL, so of two concurrent first uses only one attaches —
+   * the other is refused, and its rollback discards the session it made.
+   * Removed by the 15E.4e contract step.
+   */
+  private async attachLegacySession(tx: Prisma.TransactionClient, tokenId: number, now: Date): Promise<number> {
+    const token = await tx.refreshToken.findUniqueOrThrow({
+      where: { id: tokenId },
+      select: { userId: true, createdAt: true, expiresAt: true },
+    });
+    const session = await tx.authSession.create({
+      data: {
+        userId: token.userId,
+        createdAt: token.createdAt,
+        absoluteExpiresAt: legacySessionExpiry(token.createdAt, token.expiresAt),
+        lastUsedAt: now,
+        ...sessionDeviceMetadata(),
+      },
+      select: { id: true },
+    });
+    const attached = await tx.refreshToken.updateMany({
+      where: { id: tokenId, sessionId: null, rotatedAt: null, revokedAt: null, expiresAt: { gt: now } },
+      data: { sessionId: session.id },
+    });
+    if (attached.count !== 1) throw new RefreshRejected();
+    return session.id;
+  }
+
+  /**
+   * Ends the whole session the presented refresh token belongs to (Phase
+   * 15E.4b). Possession of the session's CURRENT refresh token is the proof —
+   * no access token is needed, so sign-out works after the access token has
+   * expired. A token that is unknown, expired, revoked or already rotated
+   * ends nothing (an old token must not be enough to end someone's session;
+   * what a replayed rotated token should trigger is decided in 15E.4c). The
+   * response is the same in every case.
+   */
   async logout(refreshToken: string) {
     const tokenHash = this.hashToken(refreshToken);
-    await this.prisma.refreshToken.updateMany({
-      where: { tokenHash, revokedAt: null },
-      data: { revokedAt: new Date() },
+    const now = new Date();
+
+    await this.prisma.$transaction(async (tx) => {
+      const presented = await tx.refreshToken.findUnique({
+        where: { tokenHash },
+        select: {
+          id: true,
+          sessionId: true,
+          rotatedAt: true,
+          revokedAt: true,
+          expiresAt: true,
+          user: { select: { id: true, role: true } },
+        },
+      });
+      if (!presented || presented.rotatedAt || presented.revokedAt || presented.expiresAt <= now) return;
+
+      if (presented.sessionId === null) {
+        // Legacy token, no session yet: it is the whole session.
+        await tx.refreshToken.updateMany({ where: { id: presented.id, revokedAt: null }, data: { revokedAt: now } });
+        return;
+      }
+
+      // Session row first (it waits for a refresh in flight), then its tokens —
+      // in a fresh snapshot that includes a successor that refresh committed.
+      const session = await tx.authSession.updateMany({
+        where: { id: presented.sessionId, revokedAt: null },
+        data: { revokedAt: now, revokedReason: SessionRevokedReason.LOGOUT },
+      });
+      const tokens = await tx.refreshToken.updateMany({
+        where: { sessionId: presented.sessionId, revokedAt: null },
+        data: { revokedAt: now },
+      });
+      if (session.count === 1) {
+        await tx.auditLog.create({
+          data: {
+            ...auditRequestFields(),
+            actorId: presented.user.id,
+            actorRole: presented.user.role,
+            action: AuditAction.UPDATE,
+            entityType: 'AuthSession',
+            entityId: presented.sessionId,
+            before: { revoked: false } as Prisma.InputJsonValue,
+            after: {
+              revoked: true,
+              reason: SessionRevokedReason.LOGOUT,
+              tokensRevoked: tokens.count,
+            } as Prisma.InputJsonValue,
+            note: 'Signed out',
+          },
+        });
+      }
     });
+
     return { success: true };
   }
 
@@ -267,7 +429,7 @@ export class AuthService {
       data: { lastLoginAt: new Date(), phoneVerified: true },
     });
 
-    const tokens = await this.issueTokens(user);
+    const tokens = await this.startSession(user);
     return { user: this.sanitizeUser({ ...user, phoneVerified: true }), ...tokens };
   }
 
@@ -475,9 +637,9 @@ export class AuthService {
     const now = new Date();
 
     // One transaction: consuming the code, the new password, the end of every
-    // existing session (refresh tokens revoked; sessionVersion bumped so
-    // outstanding access tokens die on their next request) and the security
-    // audit row. Whoever held the old credentials — including an attacker —
+    // existing session (every AuthSession and refresh token revoked — 15E.4b;
+    // sessionVersion bumped so outstanding access tokens die on their next
+    // request) and the security audit row. Whoever held the old credentials — including an attacker —
     // is signed out; the user signs in again with the new password (15B).
     await this.prisma.$transaction(async (tx) => {
       // Atomic single use (15E.2): a concurrent request with the same code
@@ -489,10 +651,8 @@ export class AuthService {
         where: { phone: dto.phone },
         data: { passwordHash, sessionVersion: { increment: 1 } },
       });
-      const revoked = await tx.refreshToken.updateMany({
-        where: { userId: user.id, revokedAt: null },
-        data: { revokedAt: now },
-      });
+      // The user row is written (and so locked) above, before any session row.
+      const revoked = await revokeAllUserSessions(tx, user.id, SessionRevokedReason.PASSWORD_RESET, now);
       await tx.auditLog.create({
         data: {
           ...auditRequestFields(),
@@ -502,7 +662,7 @@ export class AuthService {
           entityType: 'UserCredentials',
           entityId: user.id,
           before: {} as Prisma.InputJsonValue,
-          after: { passwordReset: true, sessionsRevoked: revoked.count } as Prisma.InputJsonValue,
+          after: { passwordReset: true, ...revoked } as Prisma.InputJsonValue,
           note: 'Password reset via SMS code',
         },
       });
@@ -511,33 +671,56 @@ export class AuthService {
     return { message: "Parol o'zgartirildi" };
   }
 
-  private async issueTokens(user: {
-    id: number;
-    phone: string;
-    role: UserRole;
-    sessionVersion: number;
-  }): Promise<TokenPair> {
-    const userId = user.id;
-    const payload: JwtPayload = { sub: user.id, phone: user.phone, role: user.role, sv: user.sessionVersion };
+  /**
+   * One successful sign-in (password, registration, SMS code) = exactly one
+   * new AuthSession with its first refresh token, written together by one
+   * nested create. The session's absolute expiry is fixed here and never
+   * extended. Only the token's SHA-256 is stored; the raw value exists only
+   * in the response.
+   */
+  private async startSession(user: SessionUser): Promise<TokenPair> {
+    const now = new Date();
+    const absoluteExpiresAt = new Date(now.getTime() + ABSOLUTE_SESSION_TTL_MS);
+    const refreshToken = this.newRefreshToken();
 
-    const accessToken = await this.jwtService.signAsync(payload, {
+    await this.prisma.authSession.create({
+      data: {
+        userId: user.id,
+        createdAt: now,
+        absoluteExpiresAt,
+        lastUsedAt: now,
+        ...sessionDeviceMetadata(),
+        refreshTokens: {
+          create: {
+            userId: user.id,
+            tokenHash: this.hashToken(refreshToken),
+            expiresAt: refreshTokenExpiry(now, this.refreshTtlMs(), absoluteExpiresAt),
+          },
+        },
+      },
+      select: { id: true },
+    });
+
+    return { accessToken: await this.signAccessToken(user), refreshToken };
+  }
+
+  private signAccessToken(user: SessionUser): Promise<string> {
+    const payload: JwtPayload = { sub: user.id, phone: user.phone, role: user.role, sv: user.sessionVersion };
+    return this.jwtService.signAsync(payload, {
       secret: process.env.JWT_ACCESS_SECRET,
       expiresIn: process.env.JWT_ACCESS_EXPIRES_IN ?? '15m',
     });
+  }
 
-    const refreshToken = crypto.randomBytes(48).toString('hex');
-    const tokenHash = this.hashToken(refreshToken);
-    const expiresAt = this.addDuration(new Date(), process.env.JWT_REFRESH_EXPIRES_IN ?? '30d');
+  /** 48 bytes from the CSPRNG, hex-encoded (96 characters). */
+  private newRefreshToken(): string {
+    return crypto.randomBytes(48).toString('hex');
+  }
 
-    await this.prisma.refreshToken.create({
-      data: {
-        userId,
-        tokenHash,
-        expiresAt,
-      },
-    });
-
-    return { accessToken, refreshToken };
+  /** The per-token (idle) lifetime; every session is separately capped at 90 days. */
+  private refreshTtlMs(): number {
+    const base = new Date(0);
+    return this.addDuration(base, process.env.JWT_REFRESH_EXPIRES_IN ?? '30d').getTime() - base.getTime();
   }
 
   private hashToken(token: string): string {
@@ -567,4 +750,8 @@ export class AuthService {
     const { passwordHash, ...rest } = user;
     return { ...rest, capabilities: capabilitiesFor(user.role) };
   }
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
 }
