@@ -131,6 +131,8 @@ function createDb() {
         if (refreshTokens?.create) await db.refreshToken.create({ data: { ...refreshTokens.create, sessionId: row.id } });
         return { id: row.id };
       },
+      // JwtStrategy's session check for tokens carrying `sid` (15E.4d.1).
+      findUnique: async ({ where }: { where: { id: number } }) => sessions.find((x) => x.id === where.id) ?? null,
       findUniqueOrThrow: async ({ where }: { where: { id: number } }) => {
         const row = sessions.find((x) => x.id === where.id);
         if (!row) throw new Error('not found');
@@ -293,7 +295,7 @@ describe('Session security (Phase 15B, sessions since 15E.4b)', () => {
     await admin.suspendUser(2, superAdmin, 'Fraud report');
     await admin.activateUser(2, superAdmin, 'Cleared');
 
-    await expect(authenticate(session.accessToken)).rejects.toThrow('Session has been revoked');
+    await expect(authenticate(session.accessToken)).rejects.toThrow(UnauthorizedException);
     await expect(auth.refresh({ refreshToken: session.refreshToken })).rejects.toThrow(UnauthorizedException);
 
     const fresh = await auth.login({ phone: PHONE, password: 'old-password' });
@@ -345,6 +347,74 @@ describe('Session security (Phase 15B, sessions since 15E.4b)', () => {
 
     await expect(authenticate(other.accessToken)).resolves.toEqual(expect.objectContaining({ id: 3 }));
     await expect(auth.refresh({ refreshToken: other.refreshToken })).resolves.toBeDefined();
+  });
+
+  describe('Phase 15E.4d.1 — access tokens bound to their session (sid)', () => {
+    const claims = (token: string) => jwt.decode(token) as JwtPayload;
+
+    it('login and refresh issue tokens carrying the session id; refresh keeps it', async () => {
+      const first = await auth.login({ phone: PHONE, password: 'old-password' });
+      const next = await auth.refresh({ refreshToken: first.refreshToken });
+
+      expect(claims(first.accessToken).sid).toBe(db.sessions[0].id);
+      expect(claims(next.accessToken).sid).toBe(db.sessions[0].id);
+      await expect(authenticate(next.accessToken)).resolves.toEqual(expect.objectContaining({ id: 2 }));
+    });
+
+    it('logout ends that session’s access token immediately; another session’s token keeps working', async () => {
+      const a = await auth.login({ phone: PHONE, password: 'old-password' });
+      const b = await auth.login({ phone: PHONE, password: 'old-password' });
+
+      await auth.logout(a.refreshToken);
+
+      await expect(authenticate(a.accessToken)).rejects.toThrow(UnauthorizedException);
+      await expect(authenticate(b.accessToken)).resolves.toEqual(expect.objectContaining({ id: 2 }));
+    });
+
+    it('a session past its absolute expiry refuses its access token', async () => {
+      const session = await auth.login({ phone: PHONE, password: 'old-password' });
+      db.sessions[0].absoluteExpiresAt = new Date(Date.now() - 1000);
+      await expect(authenticate(session.accessToken)).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('a sid naming no session, another user’s session, or not an integer → the same bare 401', async () => {
+      db.users.push({ ...db.users[0], id: 3, phone: '+998901112244' });
+      const other = await auth.login({ phone: '+998901112244', password: 'old-password' });
+      const otherSid = claims(other.accessToken).sid!;
+      const forge = (sid: unknown) =>
+        jwt.signAsync({ sub: 2, phone: PHONE, role: UserRole.BUSINESS_OWNER, sv: 0, sid } as object, {
+          secret: process.env.JWT_ACCESS_SECRET,
+        });
+
+      for (const sid of [999, otherSid, 0, -1, 1.5, '1']) {
+        const error = await authenticate(await forge(sid)).catch((e) => e);
+        expect(error).toBeInstanceOf(UnauthorizedException);
+        expect(error.getResponse()).toEqual({ message: 'Unauthorized', statusCode: 401 });
+      }
+    });
+
+    it('a failed session lookup refuses the request (fail closed)', async () => {
+      const session = await auth.login({ phone: PHONE, password: 'old-password' });
+      (db.authSession as { findUnique: unknown }).findUnique = async () => {
+        throw new Error('database unavailable');
+      };
+      const error = await authenticate(session.accessToken).catch((e) => e);
+      expect(error).toBeInstanceOf(UnauthorizedException);
+      expect(error.getResponse()).toEqual({ message: 'Unauthorized', statusCode: 401 });
+    });
+
+    it('inactive-user and sessionVersion refusals are the same bare 401 (no state disclosed)', async () => {
+      const session = await auth.login({ phone: PHONE, password: 'old-password' });
+      db.users[0].sessionVersion = 5;
+      const versionError = await authenticate(session.accessToken).catch((e) => e);
+      db.users[0].sessionVersion = 0;
+      db.users[0].status = UserStatus.SUSPENDED;
+      const statusError = await authenticate(session.accessToken).catch((e) => e);
+
+      for (const error of [versionError, statusError]) {
+        expect(error.getResponse()).toEqual({ message: 'Unauthorized', statusCode: 401 });
+      }
+    });
   });
 
   describe('Phase 15E.4b — sessions', () => {

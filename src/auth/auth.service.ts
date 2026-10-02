@@ -86,7 +86,7 @@ class RefreshRejected extends Error {
 }
 
 /** A rotation that committed: the one successor. */
-type Rotated = { kind: 'rotated'; user: User; refreshToken: string };
+type Rotated = { kind: 'rotated'; user: User; refreshToken: string; sessionId: number };
 /** Reuse that committed its session revocation (15E.4c); still the generic 401. */
 type ReuseDetected = { kind: 'reuse'; sessionId: number; tokenId: number; userId: number };
 
@@ -243,7 +243,7 @@ export class AuthService {
       );
       throw new UnauthorizedException(INVALID_REFRESH_MESSAGE);
     }
-    const accessToken = await this.signAccessToken(outcome.user);
+    const accessToken = await this.signAccessToken(outcome.user, outcome.sessionId);
     return { user: this.sanitizeUser(outcome.user), accessToken, refreshToken: outcome.refreshToken };
   }
 
@@ -304,7 +304,7 @@ export class AuthService {
         expiresAt: refreshTokenExpiry(now, this.refreshTtlMs(), session.absoluteExpiresAt),
       },
     });
-    return { kind: 'rotated', user, refreshToken };
+    return { kind: 'rotated', user, refreshToken, sessionId };
   }
 
   /**
@@ -823,7 +823,7 @@ export class AuthService {
     const absoluteExpiresAt = new Date(now.getTime() + ABSOLUTE_SESSION_TTL_MS);
     const refreshToken = this.newRefreshToken();
 
-    await this.prisma.authSession.create({
+    const session = await this.prisma.authSession.create({
       data: {
         userId: user.id,
         createdAt: now,
@@ -841,11 +841,24 @@ export class AuthService {
       select: { id: true },
     });
 
-    return { accessToken: await this.signAccessToken(user), refreshToken };
+    return { accessToken: await this.signAccessToken(user, session.id), refreshToken };
   }
 
-  private signAccessToken(user: SessionUser): Promise<string> {
-    const payload: JwtPayload = { sub: user.id, phone: user.phone, role: user.role, sv: user.sessionVersion };
+  /**
+   * The one place access tokens are minted. `sid` binds the token to its
+   * AuthSession (Phase 15E.4d.1), so revoking or expiring that session ends
+   * the token at once (JwtStrategy). It is required here, so no sign-in or
+   * refresh path can issue a token without it. The lifetime stays
+   * JWT_ACCESS_EXPIRES_IN, independent of the session's absolute expiry.
+   */
+  private signAccessToken(user: SessionUser, sessionId: number): Promise<string> {
+    const payload: JwtPayload = {
+      sub: user.id,
+      phone: user.phone,
+      role: user.role,
+      sv: user.sessionVersion,
+      sid: sessionId,
+    };
     return this.jwtService.signAsync(payload, {
       secret: process.env.JWT_ACCESS_SECRET,
       expiresIn: process.env.JWT_ACCESS_EXPIRES_IN ?? '15m',
