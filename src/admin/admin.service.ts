@@ -14,6 +14,7 @@ import {
   Prisma,
   ReportStatus,
   ReviewStatus,
+  SessionRevokedReason,
   UserRole,
   UserStatus,
 } from '@prisma/client';
@@ -39,6 +40,7 @@ import { auditRequestFields } from '../common/request-context/request-context';
 import { replacePrimaryBranchHours } from '../businesses/business-hours';
 import { BusinessHourInputDto } from '../businesses/dto/update-business-hours.dto';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+import { revokeAllUserSessions } from '../auth/refresh-sessions';
 import { assertCanChangeUserStatus, isEmergencyFreeze } from '../authz/user-status.policy';
 import { hasCapability } from '../authz/capabilities';
 import {
@@ -1360,9 +1362,11 @@ export class AdminService {
   // user-status.policy.ts — never rank arithmetic. The transition is
   // compare-and-set on BOTH status and role (a role change between our read
   // and our write must not let the policy decision go stale), and in the same
-  // transaction every session of the target dies: refresh tokens are revoked
-  // and sessionVersion is bumped so outstanding access tokens fail their next
-  // request (JwtStrategy also rejects any non-ACTIVE account outright).
+  // transaction every session of the target dies: AuthSessions and refresh
+  // tokens are revoked (15E.4b) and sessionVersion is bumped so outstanding
+  // access tokens fail their next request (JwtStrategy also rejects any
+  // non-ACTIVE account outright). activateUser never touches sessions, so
+  // reinstatement revives none of them.
   async suspendUser(id: number, actor: AuthenticatedUser, reason: string) {
     return this.prisma.$transaction(async (tx) => {
       const user = await this.getActionableUser(tx, id);
@@ -1377,10 +1381,9 @@ export class AdminService {
       if (count === 0) {
         throw new ConflictException(`User ${id} changed concurrently; reload and try again`);
       }
-      const revoked = await tx.refreshToken.updateMany({
-        where: { userId: id, revokedAt: null },
-        data: { revokedAt: now },
-      });
+      // Every AuthSession and refresh token of the target (15E.4b). The user
+      // row was written (and so locked) just above, before any session row.
+      const revoked = await revokeAllUserSessions(tx, id, SessionRevokedReason.SUSPENDED, now);
       const updated = await tx.user.findUniqueOrThrow({ where: { id } });
 
       // A SUPER_ADMIN suspending an ADMIN is an emergency freeze: containment
@@ -1394,7 +1397,7 @@ export class AdminService {
         'User',
         id,
         { status: user.status, role: user.role },
-        { status: updated.status, kind, sessionsRevoked: revoked.count },
+        { status: updated.status, kind, ...revoked },
         reason,
       );
 

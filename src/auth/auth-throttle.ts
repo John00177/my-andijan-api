@@ -43,6 +43,7 @@ export const AUTH_LIMITS = {
   login: { ip: { limit: 60, ttl: MINUTE }, phone: { limit: 10, ttl: QUARTER_HOUR } },
   register: { ip: { limit: 10, ttl: MINUTE }, phone: { limit: 5, ttl: QUARTER_HOUR } },
   refresh: { ip: { limit: 120, ttl: MINUTE } },
+  logout: { ip: { limit: 60, ttl: MINUTE } },
   otpRequest: { ip: { limit: 20, ttl: MINUTE }, phone: { limit: 5, ttl: QUARTER_HOUR } },
   otpVerify: { ip: { limit: 60, ttl: MINUTE }, phone: { limit: 10, ttl: QUARTER_HOUR } },
   forgotPassword: { ip: { limit: 20, ttl: MINUTE }, phone: { limit: 5, ttl: QUARTER_HOUR } },

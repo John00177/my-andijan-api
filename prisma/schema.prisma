@@ -168,6 +168,17 @@ enum NotificationType {
   SYSTEM
 }
 
+// Why an AuthSession ended (Phase 15E.4b). REUSE_DETECTED is written from
+// Phase 15E.4c on and LEGACY_MIGRATION by the 15E.4e contract step; both are
+// declared now so those phases need no enum migration.
+enum SessionRevokedReason {
+  LOGOUT
+  PASSWORD_RESET
+  SUSPENDED
+  REUSE_DETECTED
+  LEGACY_MIGRATION
+}
+
 enum AuditAction {
   CREATE
   UPDATE
@@ -230,6 +241,7 @@ model User {
 
   district         District?       @relation(fields: [districtId], references: [id], onDelete: SetNull)
   refreshTokens    RefreshToken[]
+  authSessions     AuthSession[]
   ownedBusinesses  Business[]      @relation("BusinessOwner")
   reviews          Review[]
   reviewReplies    ReviewReply[]
@@ -252,20 +264,66 @@ model User {
   @@map("users")
 }
 
+// One row per successful sign-in on one device (Phase 15E.4b): the token
+// family. Every refresh token belongs to exactly one session, and rotation
+// keeps it there. The session row is the serialization point: every refresh
+// and every revocation takes this row's lock first (see
+// src/auth/refresh-sessions.ts), so a rotation can never slip past a
+// revocation and one token can never produce two successors.
+model AuthSession {
+  id     Int @id @default(autoincrement())
+  userId Int @map("user_id")
+
+  createdAt         DateTime              @default(now()) @map("created_at")
+  // createdAt + 90 days, fixed at sign-in. Refresh never extends it.
+  absoluteExpiresAt DateTime              @map("absolute_expires_at")
+  revokedAt         DateTime?             @map("revoked_at")
+  revokedReason     SessionRevokedReason? @map("revoked_reason")
+  // Written by every successful refresh.
+  lastUsedAt        DateTime              @default(now()) @map("last_used_at")
+
+  // Device metadata from the request context at sign-in, bounded to the
+  // same widths as audit_logs.
+  userAgent String? @map("user_agent") @db.VarChar(500)
+  ipAddress String? @map("ip_address") @db.VarChar(45)
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokens RefreshToken[]
+
+  @@index([userId])
+  @@index([userId, revokedAt])
+  @@map("auth_sessions")
+}
+
+// Only the SHA-256 of a refresh token is stored — never the token itself.
 model RefreshToken {
   id        Int       @id @default(autoincrement())
   userId    Int       @map("user_id")
   tokenHash String    @unique @map("token_hash")
   expiresAt DateTime  @map("expires_at")
   revokedAt DateTime? @map("revoked_at")
+  // Unused; superseded by the session-level fields. Dropped in 15E.4e.
   userAgent String?   @map("user_agent") @db.VarChar(500)
   ipAddress String?   @map("ip_address") @db.VarChar(45)
   createdAt DateTime  @default(now()) @map("created_at")
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Phase 15E.4b. sessionId is nullable only while tokens issued by the
+  // pre-15E.4b code can still exist; 15E.4e makes it NOT NULL.
+  sessionId Int?      @map("session_id")
+  // Set (together with revokedAt) by the one refresh that rotated this token.
+  rotatedAt DateTime? @map("rotated_at")
+  // The token this one replaced. UNIQUE: the database itself refuses a
+  // second successor of the same token.
+  parentId  Int?      @unique @map("parent_id")
+
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session   AuthSession?  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  parent    RefreshToken? @relation("RefreshTokenRotation", fields: [parentId], references: [id], onDelete: SetNull)
+  successor RefreshToken? @relation("RefreshTokenRotation")
 
   @@index([userId])
   @@index([expiresAt])
+  @@index([sessionId])
   @@map("refresh_tokens")
 }
 
@@ -478,11 +536,11 @@ model Business {
   metaDescriptionRu String? @map("meta_description_ru") @db.VarChar(400)
   metaDescriptionEn String? @map("meta_description_en") @db.VarChar(400)
 
-  status          BusinessStatus @default(DRAFT)
-  isVerified      Boolean        @default(false) @map("is_verified")
-  verifiedAt      DateTime?      @map("verified_at")
-  verifiedById    Int?           @map("verified_by_id")
-  rejectionReason String?        @map("rejection_reason") @db.Text
+  status           BusinessStatus  @default(DRAFT)
+  isVerified       Boolean         @default(false) @map("is_verified")
+  verifiedAt       DateTime?       @map("verified_at")
+  verifiedById     Int?            @map("verified_by_id")
+  rejectionReason  String?         @map("rejection_reason") @db.Text
   // Status the business had when a SUPER_ADMIN hid it; written by hide, read
   // and cleared by unhide. Null = not hidden, or hidden before this column
   // existed — unhide then falls back to PENDING instead of guessing (D-73).
@@ -708,8 +766,8 @@ model Review {
   userId   Int @map("user_id")
 
   rating  Int
-  title   String? @db.VarChar(200)
-  comment String  @db.Text
+  title   String?  @db.VarChar(200)
+  comment String   @db.Text
   photos  String[] @default([])
 
   status         ReviewStatus @default(PUBLISHED)

@@ -27,7 +27,28 @@ type UserRow = {
   deletedAt: Date | null;
   lastLoginAt: Date | null;
 };
-type TokenRow = { id: number; userId: number; tokenHash: string; expiresAt: Date; revokedAt: Date | null };
+type TokenRow = {
+  id: number;
+  userId: number;
+  sessionId: number | null;
+  parentId: number | null;
+  tokenHash: string;
+  expiresAt: Date;
+  rotatedAt: Date | null;
+  revokedAt: Date | null;
+  createdAt: Date;
+};
+type SessionRow = {
+  id: number;
+  userId: number;
+  createdAt: Date;
+  absoluteExpiresAt: Date;
+  lastUsedAt: Date;
+  revokedAt: Date | null;
+  revokedReason: string | null;
+  userAgent: string | null;
+  ipAddress: string | null;
+};
 type OtpRow = {
   id: number;
   phone: string;
@@ -50,19 +71,27 @@ function applyData<T extends Record<string, unknown>>(row: T, data: Record<strin
   }
 }
 
+// Scalar equality (null included) and { gt } — the filters the services use.
 function matches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
-  return Object.entries(where).every(([key, value]) => row[key] === value);
+  return Object.entries(where).every(([key, value]) => {
+    if (value && typeof value === 'object' && 'gt' in (value as object)) {
+      return (row[key] as Date) > (value as { gt: Date }).gt;
+    }
+    return row[key] === value;
+  });
 }
 
 function createDb() {
   const users: UserRow[] = [];
   const tokens: TokenRow[] = [];
+  const sessions: SessionRow[] = [];
   const otps: OtpRow[] = [];
   const audit: unknown[] = [];
 
   const db = {
     users,
     tokens,
+    sessions,
     otps,
     audit,
     user: {
@@ -85,22 +114,62 @@ function createDb() {
         return { count: hit.length };
       },
     },
+    authSession: {
+      create: async ({ data }: { data: Record<string, any> }) => {
+        const { refreshTokens, ...fields } = data;
+        const row = {
+          id: sessions.length + 1,
+          createdAt: new Date(),
+          lastUsedAt: new Date(),
+          revokedAt: null,
+          revokedReason: null,
+          userAgent: null,
+          ipAddress: null,
+          ...fields,
+        } as SessionRow;
+        sessions.push(row);
+        if (refreshTokens?.create) await db.refreshToken.create({ data: { ...refreshTokens.create, sessionId: row.id } });
+        return { id: row.id };
+      },
+      findUniqueOrThrow: async ({ where }: { where: { id: number } }) => {
+        const row = sessions.find((x) => x.id === where.id);
+        if (!row) throw new Error('not found');
+        return row;
+      },
+      updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        const hit = sessions.filter((x) => matches(x, where));
+        hit.forEach((x) => applyData(x, data));
+        return { count: hit.length };
+      },
+    },
     refreshToken: {
-      create: async ({ data }: { data: Omit<TokenRow, 'id' | 'revokedAt'> }) => {
-        const row = { id: tokens.length + 1, revokedAt: null, ...data };
+      create: async ({ data }: { data: Partial<TokenRow> }) => {
+        // parent_id UNIQUE, as in the real schema.
+        if (data.parentId != null && tokens.some((t) => t.parentId === data.parentId)) {
+          throw new Error('unique violation: parent_id');
+        }
+        const row = {
+          id: tokens.length + 1,
+          sessionId: null,
+          parentId: null,
+          rotatedAt: null,
+          revokedAt: null,
+          createdAt: new Date(),
+          ...data,
+        } as TokenRow;
         tokens.push(row);
         return row;
       },
-      findUnique: async ({ where }: { where: { tokenHash: string } }) => {
-        const row = tokens.find((t) => t.tokenHash === where.tokenHash);
-        return row ? { ...row, user: users.find((u) => u.id === row.userId) } : null;
+      findUnique: async ({ where }: { where: { tokenHash?: string; id?: number } }) => {
+        const row = tokens.find((t) => (where.tokenHash ? t.tokenHash === where.tokenHash : t.id === where.id));
+        return row ? { ...row, user: users.find((u) => u.id === row.userId), successor: tokens.find((t) => t.parentId === row.id) ?? null } : null;
       },
-      update: async ({ where, data }: { where: { id: number }; data: Record<string, unknown> }) => {
-        const row = tokens.find((t) => t.id === where.id)!;
-        applyData(row, data);
-        return row;
+      findUniqueOrThrow: async ({ where }: { where: { id: number } }) => {
+        const row = tokens.find((t) => t.id === where.id);
+        if (!row) throw new Error('not found');
+        return { ...row, user: users.find((u) => u.id === row.userId), successor: tokens.find((t) => t.parentId === row.id) ?? null };
       },
-      updateMany: async ({ where, data }: { where: Partial<TokenRow>; data: Record<string, unknown> }) => {
+      updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
         const hit = tokens.filter((t) => matches(t, where));
         hit.forEach((t) => applyData(t, data));
         return { count: hit.length };
@@ -144,13 +213,28 @@ function createDb() {
       },
     },
     auditLog: { create: async ({ data }: { data: unknown }) => audit.push(data) },
-    $transaction: async (arg: unknown) =>
-      typeof arg === 'function' ? (arg as (tx: unknown) => unknown)(db) : Promise.all(arg as Promise<unknown>[]),
+    // An interactive transaction that throws is rolled back, as in Postgres.
+    $transaction: async (arg: unknown) => {
+      if (typeof arg !== 'function') return Promise.all(arg as Promise<unknown>[]);
+      const tables = [users, tokens, sessions, otps] as Array<Array<Record<string, unknown>>>;
+      const saved = tables.map((rows) => rows.map((row) => ({ ...row })));
+      const savedAudit = audit.length;
+      try {
+        return await (arg as (tx: unknown) => unknown)(db);
+      } catch (error) {
+        tables.forEach((rows, i) => {
+          rows.length = 0;
+          saved[i].forEach((row) => rows.push(row));
+        });
+        audit.length = savedAudit;
+        throw error;
+      }
+    },
   };
   return db;
 }
 
-describe('Session security (Phase 15B)', () => {
+describe('Session security (Phase 15B, sessions since 15E.4b)', () => {
   let db: ReturnType<typeof createDb>;
   let auth: AuthService;
   let admin: AdminService;
@@ -201,6 +285,7 @@ describe('Session security (Phase 15B)', () => {
     await expect(authenticate(session.accessToken)).rejects.toThrow(UnauthorizedException);
     await expect(auth.refresh({ refreshToken: session.refreshToken })).rejects.toThrow(UnauthorizedException);
     expect(db.tokens.every((t) => t.revokedAt)).toBe(true);
+    expect(db.sessions.every((x) => x.revokedAt && x.revokedReason === 'SUSPENDED')).toBe(true);
   });
 
   it('reinstating the account does NOT revive the pre-suspension session; a fresh login does work', async () => {
@@ -239,7 +324,7 @@ describe('Session security (Phase 15B)', () => {
       expect.objectContaining({ accessToken: expect.any(String) }),
     );
     expect(db.audit).toContainEqual(
-      expect.objectContaining({ entityType: 'UserCredentials', entityId: 2, after: { passwordReset: true, sessionsRevoked: 1 } }),
+      expect.objectContaining({ entityType: 'UserCredentials', entityId: 2, after: { passwordReset: true, sessionsRevoked: 1, tokensRevoked: 1 } }),
     );
   });
 
@@ -260,5 +345,68 @@ describe('Session security (Phase 15B)', () => {
 
     await expect(authenticate(other.accessToken)).resolves.toEqual(expect.objectContaining({ id: 3 }));
     await expect(auth.refresh({ refreshToken: other.refreshToken })).resolves.toBeDefined();
+  });
+
+  describe('Phase 15E.4b — sessions', () => {
+    it('refresh rotates within the same session; the old token is refused afterwards', async () => {
+      const first = await auth.login({ phone: PHONE, password: 'old-password' });
+      const next = await auth.refresh({ refreshToken: first.refreshToken });
+
+      expect(db.sessions).toHaveLength(1);
+      const [r1, r2] = db.tokens;
+      expect(r2).toEqual(
+        expect.objectContaining({ sessionId: r1.sessionId, parentId: r1.id, rotatedAt: null, revokedAt: null }),
+      );
+      expect(r1.rotatedAt).toEqual(expect.any(Date));
+      await expect(auth.refresh({ refreshToken: first.refreshToken })).rejects.toThrow('Invalid or expired refresh token');
+      await expect(auth.refresh({ refreshToken: next.refreshToken })).resolves.toBeDefined();
+    });
+
+    it('a refresh for a suspended account is refused and rolls back completely (no rotation, no successor)', async () => {
+      const first = await auth.login({ phone: PHONE, password: 'old-password' });
+      db.users[0].status = UserStatus.SUSPENDED; // status changed outside the revocation path
+
+      await expect(auth.refresh({ refreshToken: first.refreshToken })).rejects.toThrow(UnauthorizedException);
+      expect(db.tokens).toHaveLength(1);
+      expect(db.tokens[0]).toEqual(expect.objectContaining({ rotatedAt: null, revokedAt: null }));
+    });
+
+    it('logout needs no access token, ends the whole session, and answers the same for any token', async () => {
+      const first = await auth.login({ phone: PHONE, password: 'old-password' });
+      const next = await auth.refresh({ refreshToken: first.refreshToken });
+
+      await expect(auth.logout(next.refreshToken)).resolves.toEqual({ success: true });
+      expect(db.sessions[0]).toEqual(expect.objectContaining({ revokedReason: 'LOGOUT', revokedAt: expect.any(Date) }));
+      await expect(auth.refresh({ refreshToken: next.refreshToken })).rejects.toThrow(UnauthorizedException);
+      await expect(auth.logout(next.refreshToken)).resolves.toEqual({ success: true });
+      await expect(auth.logout('f'.repeat(96))).resolves.toEqual({ success: true });
+      expect(db.audit).toContainEqual(
+        expect.objectContaining({
+          entityType: 'AuthSession',
+          after: { revoked: true, reason: 'LOGOUT', tokensRevoked: 1 },
+        }),
+      );
+      expect(JSON.stringify(db.audit).includes(next.refreshToken)).toBe(false);
+    });
+
+    it('logout with the token just rotated by an in-flight refresh (successor unused) ends the session', async () => {
+      const first = await auth.login({ phone: PHONE, password: 'old-password' });
+      const next = await auth.refresh({ refreshToken: first.refreshToken }); // the client never stores this
+
+      await expect(auth.logout(first.refreshToken)).resolves.toEqual({ success: true });
+      expect(db.sessions[0]).toEqual(expect.objectContaining({ revokedReason: 'LOGOUT', revokedAt: expect.any(Date) }));
+      await expect(auth.refresh({ refreshToken: next.refreshToken })).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('logout with a rotated token whose successor was already used ends nothing', async () => {
+      const first = await auth.login({ phone: PHONE, password: 'old-password' });
+      const next = await auth.refresh({ refreshToken: first.refreshToken });
+      const latest = await auth.refresh({ refreshToken: next.refreshToken }); // successor used
+
+      await expect(auth.logout(first.refreshToken)).resolves.toEqual({ success: true });
+      expect(db.sessions[0].revokedAt).toBeNull();
+      expect(db.audit).toHaveLength(0);
+      await expect(auth.refresh({ refreshToken: latest.refreshToken })).resolves.toBeDefined();
+    });
   });
 });

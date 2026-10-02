@@ -223,8 +223,26 @@ const INTENDED: Record<string, { roles: UserRole[]; reason: string }> = {
   ),
 };
 
+// The only routes deliberately opened to callers WITHOUT an access token since
+// fda2390, each with its replacement proof. Exactly one entry; adding another
+// needs the same explicit review.
+const INTENDED_PUBLIC: Record<string, string> = {
+  'POST /auth/logout':
+    'Phase 15E.4b: authenticated by possession of the session\'s current refresh token (AuthService.logout), ' +
+    'so sign-out works after the access token expires. It can only END that one session — it grants nothing, ' +
+    'returns nothing, and answers { success: true } for any token.',
+};
+
 describe('Old rank decisions vs new capability decisions', () => {
   const inventory = routeInventory();
+
+  it('routes opened to anonymous callers are exactly the reviewed list, and each really was opened', () => {
+    expect(Object.keys(INTENDED_PUBLIC)).toEqual(['POST /auth/logout']);
+    for (const route of Object.keys(INTENDED_PUBLIC)) {
+      const rule = inventory.find((e) => e.route === route)?.rule;
+      expect({ route, legacy: LEGACY[route], now: rule?.kind }).toEqual({ route, legacy: 'auth', now: 'public' });
+    }
+  });
 
   it('the frozen legacy table covers exactly the current routes', () => {
     expect(inventory.map((e) => e.route).sort()).toEqual(Object.keys(LEGACY).sort());
@@ -242,6 +260,7 @@ describe('Old rank decisions vs new capability decisions', () => {
         const before = legacyDecision(LEGACY[route], role);
         const after = decide(rule, role);
         if (before === after) continue;
+        if (role === null && before === 'unauthenticated' && after === 'allow' && INTENDED_PUBLIC[route]) continue;
         if (after === 'allow') loosened.push(`${route} ${role}: ${before} → ${after}`);
         const intended = INTENDED[route];
         if (!(intended && role !== null && intended.roles.includes(role) && before === 'allow' && after === 'forbidden')) {
