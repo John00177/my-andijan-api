@@ -5,7 +5,9 @@ import {
   HttpException,
   HttpStatus,
   Injectable,
+  Logger,
   NotFoundException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -33,11 +35,22 @@ const RESET_CODE_TTL_MINUTES = 15;
 const OTP_TTL_MINUTES = 5;
 const OTP_RATE_WINDOW_MINUTES = 10;
 const OTP_MAX_PER_WINDOW = 3;
-const MAX_OTP_ATTEMPTS = 5;
-// OtpCode.attempts already exists for exactly this — cap how many wrong
-// codes a request can absorb before it's dead, so a 6-digit code (only
-// 900,000 possibilities) can't be brute-forced online.
-const MAX_RESET_ATTEMPTS = 5;
+// Wrong-guess budget per phone + purpose (Phase 15E.2). It is counted across
+// EVERY code row created for that phone and purpose inside the window —
+// live, superseded, used or expired — so requesting a fresh code never buys
+// more guesses. A 6-digit code has only 900,000 values; 5 guesses an hour
+// keeps online brute force negligible.
+const CODE_FAILURE_WINDOW_MINUTES = 60;
+const MAX_CODE_FAILURES_PER_WINDOW = 5;
+// Who may sign in with an SMS code alone (Phase 15E.2). An allowlist, so any
+// role added later is refused by default: staff (SUPPORT, MODERATOR, ADMIN,
+// SUPER_ADMIN) must use their password — an SMS code is not a sufficient
+// factor for a privileged account.
+const OTP_LOGIN_ROLES: ReadonlySet<UserRole> = new Set<UserRole>([UserRole.CUSTOMER, UserRole.BUSINESS_OWNER]);
+const INVALID_OTP_MESSAGE = "Kod noto'g'ri yoki muddati tugagan";
+const INVALID_RESET_CODE = { valid: false, message: "Noto'g'ri kod", statusCode: 400 };
+const OTP_LOGIN_UNAVAILABLE_MESSAGE = "Bu hisobga SMS kod bilan kirib bo'lmaydi. Parol bilan kiring.";
+const SMS_UNAVAILABLE_MESSAGE = "SMS xizmati hozircha ishlamayapti. Keyinroq urinib ko'ring yoki parol bilan kiring.";
 
 interface TokenPair {
   accessToken: string;
@@ -46,6 +59,10 @@ interface TokenPair {
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+  /** A bcrypt hash of a random value, compared against when there is no real code — equal work either way. */
+  private dummyCodeHash: Promise<string> | null = null;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
@@ -172,46 +189,52 @@ export class AuthService {
   // free: a restart cannot strand a user who is mid-verification holding a
   // code that no longer exists anywhere. Codes are stored bcrypt-hashed, so a
   // database leak does not hand over live login codes.
+  //
+  // Phase 15E.2: a code is never logged, returned or put in an exception —
+  // it exists only in the SMS. With no SMS provider configured the request
+  // fails (503) instead of pretending a code was sent.
   // ============================================================================
 
   async requestOtp(dto: RequestOtpDto) {
+    this.assertSmsAvailable();
     await this.assertOtpRateLimit(dto.phone);
 
-    const code = this.generateOtpCode();
+    const code = this.generateCode();
     const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
     const expiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
-
-    // Any earlier live code is retired the moment a new one is issued, so a
-    // resend cannot leave two working codes for the same phone.
-    await this.prisma.$transaction([
-      this.prisma.otpCode.updateMany({
-        where: { phone: dto.phone, purpose: OtpPurpose.LOGIN, usedAt: null },
-        data: { usedAt: new Date() },
-      }),
-      this.prisma.otpCode.create({
-        data: { phone: dto.phone, codeHash, purpose: OtpPurpose.LOGIN, expiresAt },
-      }),
-    ]);
+    const issued = await this.issueCode(dto.phone, OtpPurpose.LOGIN, codeHash, expiresAt);
 
     // The trailing "@domain #code" line is what lets Android's WebOTP API
     // offer the code straight from the notification, and it must be the last
     // line of the message for the browser to accept it.
     const message = `My Andijan tasdiqlash kodi: ${code}. @myandijan.uz #${code}`;
-    await this.smsService.send(dto.phone, message);
+    if (!(await this.smsService.send(dto.phone, message))) {
+      // Undelivered: retire the code so it can never be used, and say so.
+      await this.retireCode(issued.id);
+      throw new ServiceUnavailableException(SMS_UNAVAILABLE_MESSAGE);
+    }
 
     return { success: true, message: 'Kod yuborildi' };
   }
 
   async verifyOtp(dto: VerifyOtpDto) {
-    const record = await this.findValidOtp(dto.phone, dto.otp, OtpPurpose.LOGIN);
-    if (!record) {
-      throw new BadRequestException("Kod noto'g'ri yoki muddati tugagan");
+    const record = await this.checkCode(dto.phone, OtpPurpose.LOGIN, dto.otp);
+    // Consume first, atomically: of concurrent requests with the same code,
+    // exactly one gets past this line.
+    if (!record || !(await this.consumeCode(this.prisma, record.id))) {
+      throw new BadRequestException(INVALID_OTP_MESSAGE);
     }
 
     let user = await this.prisma.user.findUnique({ where: { phone: dto.phone } });
 
     if (user && (user.deletedAt || user.status !== UserStatus.ACTIVE)) {
       throw new ForbiddenException('Account is not active');
+    }
+
+    // Staff never sign in by SMS code alone (Phase 15E.2). The message names
+    // no role; it only reaches whoever holds a valid code for this phone.
+    if (user && !OTP_LOGIN_ROLES.has(user.role)) {
+      throw new ForbiddenException(OTP_LOGIN_UNAVAILABLE_MESSAGE);
     }
 
     if (!user) {
@@ -239,13 +262,10 @@ export class AuthService {
       });
     }
 
-    await this.prisma.$transaction([
-      this.prisma.otpCode.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
-      this.prisma.user.update({
-        where: { id: user.id },
-        data: { lastLoginAt: new Date(), phoneVerified: true },
-      }),
-    ]);
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: { lastLoginAt: new Date(), phoneVerified: true },
+    });
 
     const tokens = await this.issueTokens(user);
     return { user: this.sanitizeUser({ ...user, phoneVerified: true }), ...tokens };
@@ -292,35 +312,106 @@ export class AuthService {
     }
   }
 
-  private generateOtpCode(): string {
-    // crypto.randomInt, not Math.random: this is a credential, and
-    // Math.random is neither uniform nor unpredictable.
+  // ============================================================================
+  // CODE LIFECYCLE — shared by OTP sign-in and password reset (Phase 15E.2)
+  // ============================================================================
+
+  /** Six digits from the CSPRNG — never Math.random, which is neither uniform nor unpredictable. */
+  private generateCode(): string {
     return String(crypto.randomInt(100000, 1000000));
   }
 
-  private async findValidOtp(phone: string, code: string, purpose: OtpPurpose): Promise<OtpCode | null> {
-    const candidates = await this.prisma.otpCode.findMany({
-      where: {
-        phone,
-        purpose,
-        usedAt: null,
-        expiresAt: { gt: new Date() },
-        attempts: { lt: MAX_OTP_ATTEMPTS },
-      },
+  /**
+   * Configuration-level check, made before anything else, so the answer is
+   * the same for every phone (no account-existence signal). Without an SMS
+   * provider a code could only be delivered by logging it, which is exactly
+   * what must never happen.
+   */
+  private assertSmsAvailable(): void {
+    if (!this.smsService.isConfigured) {
+      throw new ServiceUnavailableException(SMS_UNAVAILABLE_MESSAGE);
+    }
+  }
+
+  /**
+   * One live code per phone + purpose: every unused code is retired in the
+   * same transaction that creates the new one. Retired rows keep their
+   * `attempts`, so they still count against the failure budget.
+   */
+  private async issueCode(phone: string, purpose: OtpPurpose, codeHash: string, expiresAt: Date): Promise<OtpCode> {
+    const [, issued] = await this.prisma.$transaction([
+      this.prisma.otpCode.updateMany({ where: { phone, purpose, usedAt: null }, data: { usedAt: new Date() } }),
+      this.prisma.otpCode.create({ data: { phone, codeHash, purpose, expiresAt } }),
+    ]);
+    return issued;
+  }
+
+  private async retireCode(id: number): Promise<void> {
+    await this.prisma.otpCode.updateMany({ where: { id, usedAt: null }, data: { usedAt: new Date() } });
+  }
+
+  /**
+   * Is `code` the live code for this phone + purpose? Does NOT consume it.
+   *
+   * - Only the newest unused, unexpired row is ever compared, so superseded
+   *   codes give no extra guesses.
+   * - Before comparing, one guess is RESERVED atomically against the budget
+   *   (failures across every row of the last hour); with the budget spent the
+   *   update matches nothing and the code is refused without a comparison.
+   * - A correct guess hands its reservation back, so only failures count.
+   * - With no live code, or no budget, an equal bcrypt comparison still runs:
+   *   the timing does not reveal whether a code was ever issued.
+   */
+  private async checkCode(phone: string, purpose: OtpPurpose, code: string): Promise<OtpCode | null> {
+    const now = new Date();
+    const active = await this.prisma.otpCode.findFirst({
+      where: { phone, purpose, usedAt: null, expiresAt: { gt: now } },
       orderBy: { createdAt: 'desc' },
     });
-
-    for (const candidate of candidates) {
-      if (await bcrypt.compare(code, candidate.codeHash)) {
-        return candidate;
-      }
-      await this.prisma.otpCode.update({
-        where: { id: candidate.id },
-        data: { attempts: { increment: 1 } },
-      });
+    if (!active) {
+      await this.equalHashWork(code);
+      return null;
     }
 
-    return null;
+    const windowStart = new Date(now.getTime() - CODE_FAILURE_WINDOW_MINUTES * 60 * 1000);
+    const earlier = await this.prisma.otpCode.aggregate({
+      _sum: { attempts: true },
+      where: { phone, purpose, id: { not: active.id }, createdAt: { gte: windowStart } },
+    });
+    const allowed = MAX_CODE_FAILURES_PER_WINDOW - (earlier._sum.attempts ?? 0);
+
+    const reserved = await this.prisma.otpCode.updateMany({
+      where: { id: active.id, usedAt: null, expiresAt: { gt: now }, attempts: { lt: allowed } },
+      data: { attempts: { increment: 1 } },
+    });
+    if (reserved.count === 0) {
+      await this.equalHashWork(code);
+      return null;
+    }
+
+    if (!(await bcrypt.compare(code, active.codeHash))) {
+      return null;
+    }
+    await this.prisma.otpCode.update({ where: { id: active.id }, data: { attempts: { decrement: 1 } } });
+    return active;
+  }
+
+  /**
+   * Atomic single use: a compare-and-set on `usedAt`. Of any number of
+   * concurrent callers holding the same valid code, exactly one gets `true`.
+   */
+  private async consumeCode(client: Pick<Prisma.TransactionClient, 'otpCode'>, id: number): Promise<boolean> {
+    const { count } = await client.otpCode.updateMany({
+      where: { id, usedAt: null, expiresAt: { gt: new Date() } },
+      data: { usedAt: new Date() },
+    });
+    return count === 1;
+  }
+
+  /** The same bcrypt comparison a real code costs, against a hash nothing can match. */
+  private async equalHashWork(code: string): Promise<void> {
+    this.dummyCodeHash ??= bcrypt.hash(crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS);
+    await bcrypt.compare(code, await this.dummyCodeHash);
   }
 
   // ============================================================================
@@ -332,57 +423,72 @@ export class AuthService {
   // ============================================================================
 
   async forgotPassword(dto: ForgotPasswordDto) {
+    this.assertSmsAvailable();
     const user = await this.prisma.user.findUnique({ where: { phone: dto.phone } });
 
-    // Always return the same response regardless of whether the phone is
-    // registered — an endpoint that answers differently for known vs.
-    // unknown phones is a phone-number enumeration oracle.
+    // Always the same response and the same work whether or not the phone is
+    // registered — anything else is a phone-number enumeration oracle. A code
+    // is generated and bcrypt-hashed either way; only a real account stores
+    // it, and its SMS goes out in the background so delivery latency is not
+    // part of the response time either.
+    const code = this.generateCode();
+    const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
     if (user && !user.deletedAt && user.status === UserStatus.ACTIVE) {
-      const code = String(Math.floor(100000 + Math.random() * 900000));
-      const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
       const expiresAt = new Date(Date.now() + RESET_CODE_TTL_MINUTES * 60 * 1000);
-
-      await this.prisma.otpCode.create({
-        data: { phone: dto.phone, codeHash, purpose: OtpPurpose.PASSWORD_RESET, expiresAt },
-      });
-
-      // TODO(production): send via Eskiz SMS instead of logging. DEV MODE only —
-      // this line must not ship once the SMS provider is wired up.
-      // eslint-disable-next-line no-console
-      console.log(`[DEV] Reset code for ${dto.phone}: ${code}`);
+      const issued = await this.issueCode(dto.phone, OtpPurpose.PASSWORD_RESET, codeHash, expiresAt);
+      void this.deliverResetCode(dto.phone, code, issued.id);
     }
 
     return { message: 'Kod yuborildi' };
   }
 
+  /**
+   * Sends the reset code; on failure retires it and logs that delivery
+   * failed — never the code, never the phone. The response has already gone
+   * out with the generic message (answering differently here would reveal
+   * that the account exists).
+   */
+  private async deliverResetCode(phone: string, code: string, codeId: number): Promise<void> {
+    const message = `My Andijan parolni tiklash kodi: ${code}. @myandijan.uz #${code}`;
+    const sent = await this.smsService.send(phone, message).catch(() => false);
+    if (!sent) {
+      await this.retireCode(codeId).catch(() => undefined);
+      this.logger.error('Password-reset SMS was not delivered; the code was retired');
+    }
+  }
+
   async verifyResetCode(dto: VerifyResetCodeDto) {
-    const record = await this.findValidResetCode(dto.phone, dto.code);
+    const record = await this.checkCode(dto.phone, OtpPurpose.PASSWORD_RESET, dto.code);
     if (!record) {
-      throw new BadRequestException({ valid: false, message: "Noto'g'ri kod", statusCode: 400 });
+      throw new BadRequestException(INVALID_RESET_CODE);
     }
     return { valid: true };
   }
 
   async resetPassword(dto: ResetPasswordDto) {
-    const record = await this.findValidResetCode(dto.phone, dto.code);
+    const record = await this.checkCode(dto.phone, OtpPurpose.PASSWORD_RESET, dto.code);
     if (!record) {
-      throw new BadRequestException({ valid: false, message: "Noto'g'ri kod", statusCode: 400 });
+      throw new BadRequestException(INVALID_RESET_CODE);
     }
 
     const passwordHash = await bcrypt.hash(dto.newPassword, BCRYPT_ROUNDS);
     const now = new Date();
 
-    // One transaction: the new password, the end of every existing session
-    // (refresh tokens revoked; sessionVersion bumped so outstanding access
-    // tokens die on their next request) and the security audit row. Whoever
-    // held the old credentials — including an attacker — is signed out; the
-    // user signs in again with the new password (Phase 15B).
+    // One transaction: consuming the code, the new password, the end of every
+    // existing session (refresh tokens revoked; sessionVersion bumped so
+    // outstanding access tokens die on their next request) and the security
+    // audit row. Whoever held the old credentials — including an attacker —
+    // is signed out; the user signs in again with the new password (15B).
     await this.prisma.$transaction(async (tx) => {
+      // Atomic single use (15E.2): a concurrent request with the same code
+      // loses here, and its whole transaction — password included — rolls back.
+      if (!(await this.consumeCode(tx, record.id))) {
+        throw new BadRequestException(INVALID_RESET_CODE);
+      }
       const user = await tx.user.update({
         where: { phone: dto.phone },
         data: { passwordHash, sessionVersion: { increment: 1 } },
       });
-      await tx.otpCode.update({ where: { id: record.id }, data: { usedAt: now } });
       const revoked = await tx.refreshToken.updateMany({
         where: { userId: user.id, revokedAt: null },
         data: { revokedAt: now },
@@ -403,36 +509,6 @@ export class AuthService {
     });
 
     return { message: "Parol o'zgartirildi" };
-  }
-
-  // Multiple live codes can exist for one phone (each resend creates a new
-  // row) — check newest-first against every still-valid one, and count a
-  // wrong guess against MAX_RESET_ATTEMPTS on whichever row it was tried
-  // against, not globally per phone.
-  private async findValidResetCode(phone: string, code: string): Promise<OtpCode | null> {
-    const candidates = await this.prisma.otpCode.findMany({
-      where: {
-        phone,
-        purpose: OtpPurpose.PASSWORD_RESET,
-        usedAt: null,
-        expiresAt: { gt: new Date() },
-        attempts: { lt: MAX_RESET_ATTEMPTS },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-
-    for (const candidate of candidates) {
-      const matches = await bcrypt.compare(code, candidate.codeHash);
-      if (matches) {
-        return candidate;
-      }
-      await this.prisma.otpCode.update({
-        where: { id: candidate.id },
-        data: { attempts: { increment: 1 } },
-      });
-    }
-
-    return null;
   }
 
   private async issueTokens(user: {

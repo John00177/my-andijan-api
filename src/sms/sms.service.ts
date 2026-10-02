@@ -14,10 +14,11 @@ const REQUEST_TIMEOUT_MS = 10_000;
  * per-account, not per-instance, and re-minting on a cold start costs one
  * extra request.
  *
- * When credentials are absent the service degrades to logging the message
- * instead of sending it, which is what keeps local development and CI from
- * spending real money (and from texting real people). `isConfigured` is
- * exposed so callers can tell the two modes apart.
+ * Messages carry authentication codes, so NOTHING here ever logs a message
+ * body or a phone number (Phase 15E.2) — not when unconfigured, not on a
+ * provider error. Without credentials nothing is sent and `send` returns
+ * false; callers check `isConfigured` first and fail closed rather than
+ * pretend a code went out. Tests and local development stub this service.
  */
 @Injectable()
 export class SmsService {
@@ -31,19 +32,17 @@ export class SmsService {
     return !!(process.env.ESKIZ_EMAIL && process.env.ESKIZ_PASSWORD);
   }
 
-  async send(phone: string, message: string): Promise<void> {
+  /** True only when the provider accepted the message. Never throws, never logs the content. */
+  async send(phone: string, message: string): Promise<boolean> {
     if (!this.isConfigured) {
-      // Never throw here: an SMS provider outage (or an unconfigured
-      // environment) must not make the whole OTP endpoint fail. The caller
-      // has already persisted the code.
-      this.logger.warn(`[DEV] SMS not configured. To ${phone}: ${message}`);
-      return;
+      this.logger.warn('SMS provider is not configured; message not sent');
+      return false;
     }
 
     const token = await this.getToken();
     if (!token) {
       this.logger.error('Eskiz login failed; SMS not sent');
-      return;
+      return false;
     }
 
     try {
@@ -61,14 +60,17 @@ export class SmsService {
       });
 
       if (!res.ok) {
-        const body = await res.text().catch(() => '');
         // A 401 means the cached token died early; drop it so the next send
-        // re-logs in rather than repeating a doomed request.
+        // re-logs in rather than repeating a doomed request. The response
+        // body is not logged: a provider may echo the message back.
         if (res.status === 401) this.token = null;
-        this.logger.error(`Eskiz send failed (${res.status}): ${body.slice(0, 300)}`);
+        this.logger.error(`Eskiz send failed (${res.status})`);
+        return false;
       }
+      return true;
     } catch (err) {
-      this.logger.error(`Eskiz send threw: ${err instanceof Error ? err.message : String(err)}`);
+      this.logger.error(`Eskiz send threw: ${err instanceof Error ? err.name : 'unknown error'}`);
+      return false;
     }
   }
 

@@ -42,6 +42,8 @@ function applyData<T extends Record<string, unknown>>(row: T, data: Record<strin
   for (const [key, value] of Object.entries(data)) {
     if (value && typeof value === 'object' && 'increment' in (value as object)) {
       (row as Record<string, unknown>)[key] = (row[key] as number) + (value as { increment: number }).increment;
+    } else if (value && typeof value === 'object' && 'decrement' in (value as object)) {
+      (row as Record<string, unknown>)[key] = (row[key] as number) - (value as { decrement: number }).decrement;
     } else if (value !== undefined) {
       (row as Record<string, unknown>)[key] = value;
     }
@@ -104,13 +106,41 @@ function createDb() {
         return { count: hit.length };
       },
     },
+    // Just enough of Postgres for AuthService's code lifecycle (Phase 15E.2):
+    // the newest live code, the failure sum, and conditional updates.
     otpCode: {
-      findMany: async ({ where }: { where: { phone: string; purpose: OtpPurpose } }) =>
-        otps.filter((o) => o.phone === where.phone && o.purpose === where.purpose && !o.usedAt && o.expiresAt > new Date()),
+      findFirst: async ({ where }: { where: { phone: string; purpose: OtpPurpose } }) =>
+        otps
+          .filter((o) => o.phone === where.phone && o.purpose === where.purpose && !o.usedAt && o.expiresAt > new Date())
+          .sort((a, b) => b.id - a.id)[0] ?? null,
+      aggregate: async ({ where }: { where: { phone: string; purpose: OtpPurpose; id: { not: number } } }) => ({
+        _sum: {
+          attempts: otps
+            .filter((o) => o.phone === where.phone && o.purpose === where.purpose && o.id !== where.id.not)
+            .reduce((sum, o) => sum + o.attempts, 0),
+        },
+      }),
       update: async ({ where, data }: { where: { id: number }; data: Record<string, unknown> }) => {
         const row = otps.find((o) => o.id === where.id)!;
         applyData(row, data);
         return row;
+      },
+      updateMany: async ({
+        where,
+        data,
+      }: {
+        where: { id: number; usedAt?: null; expiresAt?: { gt: Date }; attempts?: { lt: number } };
+        data: Record<string, unknown>;
+      }) => {
+        const hit = otps.filter(
+          (o) =>
+            o.id === where.id &&
+            (where.usedAt === undefined || o.usedAt === null) &&
+            (!where.expiresAt || o.expiresAt > where.expiresAt.gt) &&
+            (!where.attempts || o.attempts < where.attempts.lt),
+        );
+        hit.forEach((o) => applyData(o, data));
+        return { count: hit.length };
       },
     },
     auditLog: { create: async ({ data }: { data: unknown }) => audit.push(data) },
