@@ -1,0 +1,10 @@
+# Keeps the SHA-pinned GitHub Actions in .github/workflows current (Phase
+# 15E.3). Each update arrives as a pull request that must pass the
+# "test-and-build" check like any other change. npm dependencies are not
+# managed here.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
