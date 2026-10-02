@@ -37,6 +37,15 @@ export const ABSOLUTE_SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000;
  */
 export const REFRESH_GRACE_WINDOW_MS = 10_000;
 
+/**
+ * Clock-skew tolerance ONLY: how far in the FUTURE (relative to the checking
+ * clock) a rotation timestamp may be and still count as recent. A rotation
+ * stamped a few milliseconds ahead comes from another request's clock (read
+ * after ours) or another replica's clock. Anything further ahead is not a
+ * plausible skew and is never treated as inside the grace window.
+ */
+export const MAX_CLOCK_SKEW_MS = 5_000;
+
 const MAX_USER_AGENT = 500;
 const MAX_IP = 45;
 
@@ -80,11 +89,12 @@ export function isWithinRefreshGraceWindow(
   now: Date,
 ): boolean {
   if (!token.rotatedAt) return false;
-  // A rotation stamped slightly AFTER `now` (another request's clock, another
-  // replica's clock) is recent by definition, so a negative interval counts
-  // as inside the window.
+  // Bounded both ways: at most REFRESH_GRACE_WINDOW_MS in the past, and at
+  // most MAX_CLOCK_SKEW_MS in the future (clock skew, nothing more).
   const sinceRotation = now.getTime() - token.rotatedAt.getTime();
-  return sinceRotation <= REFRESH_GRACE_WINDOW_MS && !successor?.rotatedAt;
+  return (
+    sinceRotation >= -MAX_CLOCK_SKEW_MS && sinceRotation <= REFRESH_GRACE_WINDOW_MS && !successor?.rotatedAt
+  );
 }
 
 type SessionClient = Pick<Prisma.TransactionClient, 'authSession' | 'refreshToken'>;

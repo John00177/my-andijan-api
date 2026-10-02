@@ -4,7 +4,7 @@ import * as bcrypt from 'bcrypt';
 import { createHash } from 'crypto';
 import { AuthService } from '../../src/auth/auth.service';
 import { AdminService } from '../../src/admin/admin.service';
-import { isWithinRefreshGraceWindow, REFRESH_GRACE_WINDOW_MS } from '../../src/auth/refresh-sessions';
+import { isWithinRefreshGraceWindow, MAX_CLOCK_SKEW_MS, REFRESH_GRACE_WINDOW_MS } from '../../src/auth/refresh-sessions';
 import { runWithRequestContext } from '../../src/common/request-context/request-context';
 import {
   createTestPrisma,
@@ -674,6 +674,21 @@ describe('Refresh-token sessions on PostgreSQL (Phase 15E.4b)', () => {
 
       expect((await prisma.authSession.findFirstOrThrow()).revokedReason).toBe(SessionRevokedReason.LOGOUT);
       expect(await liveTokens({ sessionId: r1Row.sessionId })).toBe(0);
+    });
+
+    it('a rotation stamped further in the future than the clock-skew tolerance ends nothing', async () => {
+      const { refreshToken: r1 } = await signIn();
+      const { refreshToken: r2 } = await refresh(r1);
+      const r1Row = await tokenRow(r1);
+      await prisma.refreshToken.update({
+        where: { id: r1Row.id },
+        data: { rotatedAt: new Date(Date.now() + MAX_CLOCK_SKEW_MS + 60_000) },
+      });
+
+      await expect(auth.logout(r1)).resolves.toEqual({ success: true });
+
+      expect((await prisma.authSession.findFirstOrThrow()).revokedAt).toBeNull();
+      await expect(refresh(r2)).resolves.toBeDefined();
     });
 
     it('a rotated token outside the grace window ends nothing, even with its successor unused', async () => {
