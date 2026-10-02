@@ -69,8 +69,10 @@ export function sessionDeviceMetadata(): { userAgent: string | null; ipAddress: 
 /**
  * Was this already-rotated token presented again within the grace window,
  * before its successor was ever used? True = indistinguishable from a benign
- * client race; false = possible reuse. Phase 15E.4b never revokes on either
- * answer — a rotated token simply gets the generic 401. 15E.4c builds on this.
+ * client race; false = possible reuse. In 15E.4b refresh never revokes on
+ * either answer — a rotated token simply gets the generic 401 (15E.4c builds
+ * on this). Logout uses it: a token inside the window may still end its own
+ * session, because that is a client signing out mid-refresh.
  */
 export function isWithinRefreshGraceWindow(
   token: { rotatedAt: Date | null },
@@ -78,8 +80,11 @@ export function isWithinRefreshGraceWindow(
   now: Date,
 ): boolean {
   if (!token.rotatedAt) return false;
+  // A rotation stamped slightly AFTER `now` (another request's clock, another
+  // replica's clock) is recent by definition, so a negative interval counts
+  // as inside the window.
   const sinceRotation = now.getTime() - token.rotatedAt.getTime();
-  return sinceRotation >= 0 && sinceRotation <= REFRESH_GRACE_WINDOW_MS && !successor?.rotatedAt;
+  return sinceRotation <= REFRESH_GRACE_WINDOW_MS && !successor?.rotatedAt;
 }
 
 type SessionClient = Pick<Prisma.TransactionClient, 'authSession' | 'refreshToken'>;

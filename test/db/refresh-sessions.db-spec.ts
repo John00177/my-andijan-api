@@ -6,7 +6,16 @@ import { AuthService } from '../../src/auth/auth.service';
 import { AdminService } from '../../src/admin/admin.service';
 import { isWithinRefreshGraceWindow, REFRESH_GRACE_WINDOW_MS } from '../../src/auth/refresh-sessions';
 import { runWithRequestContext } from '../../src/common/request-context/request-context';
-import { createTestPrisma, createUser, PASSWORD, raceAtSessionLock, resetDatabase, services } from './support';
+import {
+  createTestPrisma,
+  createUser,
+  inRolledBackTransaction,
+  PASSWORD,
+  raceAtSessionLock,
+  resetDatabase,
+  services,
+  waitForLockWaiters,
+} from './support';
 
 // Phase 15E.4b — refresh-token sessions against REAL PostgreSQL. In-memory
 // fakes cannot prove row-lock semantics; these tests can. The central
@@ -565,6 +574,209 @@ describe('Refresh-token sessions on PostgreSQL (Phase 15E.4b)', () => {
         data: { revokedAt: new Date() },
       });
       expect(legacyLogout.count).toBe(0);
+    });
+  });
+
+  describe('R1 — logout racing a refresh of the same session (grace-window logout)', () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const liveTokens = (where: Prisma.RefreshTokenWhereInput) =>
+      prisma.refreshToken.count({ where: { ...where, revokedAt: null } });
+
+    it('normal logout with the current token revokes the session', async () => {
+      const { refreshToken } = await signIn();
+      await expect(auth.logout(refreshToken)).resolves.toEqual({ success: true });
+      const session = await prisma.authSession.findFirstOrThrow();
+      expect(session.revokedReason).toBe(SessionRevokedReason.LOGOUT);
+      expect(await liveTokens({ sessionId: session.id })).toBe(0);
+    });
+
+    it('the refresh already committed but its response never reached the client: logout with the rotated token ends the session', async () => {
+      const { refreshToken: r1 } = await signIn();
+      const { refreshToken: r2 } = await refresh(r1); // the client never stores this — it is discarding it
+
+      await expect(auth.logout(r1)).resolves.toEqual({ success: true });
+
+      const session = await prisma.authSession.findFirstOrThrow();
+      expect(session.revokedReason).toBe(SessionRevokedReason.LOGOUT);
+      expect(await liveTokens({ sessionId: session.id })).toBe(0);
+      await expect(refresh(r2)).rejects.toThrow('Invalid or expired refresh token');
+      const audit = await prisma.auditLog.findMany({ where: { entityType: 'AuthSession' } });
+      expect(audit).toHaveLength(1);
+      expect(audit[0].after).toEqual({ revoked: true, reason: 'LOGOUT', tokensRevoked: 1 });
+    });
+
+    it('logout arrives while the refresh is mid-transaction (forced): no live successor, session revoked', async () => {
+      const { user, refreshToken: r1 } = await signIn();
+      const row = await tokenRow(r1);
+      let outcome!: Promise<PromiseSettledResult<unknown>[]>;
+
+      // An uncommitted placeholder with parent_id = R1 makes the refresh stop
+      // at its successor INSERT — after it took the session lock and rotated R1.
+      await inRolledBackTransaction(prisma, async (tx) => {
+        await tx.refreshToken.create({
+          data: {
+            userId: user.id,
+            sessionId: row.sessionId,
+            parentId: row.id,
+            tokenHash: sha256('placeholder-r1'),
+            expiresAt: new Date(Date.now() + DAY_MS),
+          },
+        });
+        const refreshing = refresh(r1);
+        await waitForLockWaiters(prisma, 'refresh_tokens', 1);
+        const loggingOut = auth.logout(r1); // still reads R1 as current; then waits on the session lock
+        await waitForLockWaiters(prisma, 'auth_sessions', 1);
+        outcome = Promise.allSettled([refreshing, loggingOut]);
+      });
+      const [refreshed, loggedOut] = await outcome;
+
+      expect(refreshed.status).toBe('fulfilled'); // the refresh committed first...
+      expect(loggedOut).toEqual({ status: 'fulfilled', value: { success: true } });
+      const session = await prisma.authSession.findUniqueOrThrow({ where: { id: row.sessionId! } });
+      expect(session.revokedReason).toBe(SessionRevokedReason.LOGOUT); // ...and logout still ended its session
+      expect(await liveTokens({ userId: user.id })).toBe(0);
+      const successor = (refreshed as PromiseFulfilledResult<{ refreshToken: string }>).value.refreshToken;
+      await expect(refresh(successor)).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('unsynchronised refresh + logout of one token, 20 rounds: the session always ends revoked with no live token', async () => {
+      for (let round = 0; round < 20; round++) {
+        const { user, refreshToken } = await signIn();
+        await Promise.allSettled([refresh(refreshToken), auth.logout(refreshToken)]);
+        expect(await liveTokens({ userId: user.id })).toBe(0);
+        expect(await prisma.authSession.count({ where: { userId: user.id, revokedAt: null } })).toBe(0);
+      }
+    });
+
+    it('a rotated token whose successor was already used ends nothing; reuse semantics are unchanged', async () => {
+      const { refreshToken: r1 } = await signIn();
+      const { refreshToken: r2 } = await refresh(r1);
+      const { refreshToken: r3 } = await refresh(r2); // the successor of R1 is used
+
+      await expect(auth.logout(r1)).resolves.toEqual({ success: true });
+
+      const session = await prisma.authSession.findFirstOrThrow();
+      expect(session.revokedAt).toBeNull();
+      expect(await prisma.auditLog.count({ where: { entityType: 'AuthSession' } })).toBe(0);
+      // Refresh still refuses the old token with the generic 401 and revokes nothing (15E.4b).
+      await expect(refresh(r1)).rejects.toThrow('Invalid or expired refresh token');
+      expect((await prisma.authSession.findFirstOrThrow()).revokedAt).toBeNull();
+      await expect(refresh(r3)).resolves.toBeDefined();
+    });
+
+    it("a rotation stamped slightly ahead of logout's clock (another request's or replica's clock) still counts as recent", async () => {
+      const { refreshToken: r1 } = await signIn();
+      await refresh(r1);
+      const r1Row = await tokenRow(r1);
+      await prisma.refreshToken.update({ where: { id: r1Row.id }, data: { rotatedAt: new Date(Date.now() + 2000) } });
+
+      await expect(auth.logout(r1)).resolves.toEqual({ success: true });
+
+      expect((await prisma.authSession.findFirstOrThrow()).revokedReason).toBe(SessionRevokedReason.LOGOUT);
+      expect(await liveTokens({ sessionId: r1Row.sessionId })).toBe(0);
+    });
+
+    it('a rotated token outside the grace window ends nothing, even with its successor unused', async () => {
+      const t0 = Date.now();
+      setNow(t0);
+      const { refreshToken: r1 } = await signIn();
+      const { refreshToken: r2 } = await refresh(r1);
+
+      setNow(t0 + REFRESH_GRACE_WINDOW_MS + 1000);
+      await expect(auth.logout(r1)).resolves.toEqual({ success: true });
+
+      expect((await prisma.authSession.findFirstOrThrow()).revokedAt).toBeNull();
+      await expect(refresh(r2)).resolves.toBeDefined();
+    });
+
+    it('entitlement is decided under the session lock: successor used while logout waited → logout rolls back', async () => {
+      const { refreshToken: r1 } = await signIn();
+      const { refreshToken: r2 } = await refresh(r1);
+      const r2Row = await tokenRow(r2);
+      let loggingOut!: Promise<unknown>;
+
+      await prisma.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT id FROM auth_sessions WHERE id = ${r2Row.sessionId} FOR UPDATE`;
+          loggingOut = auth.logout(r1); // R1 is entitled now (R2 unused) — then waits on the lock
+          await waitForLockWaiters(prisma, 'auth_sessions', 1);
+          // While it waits, the successor gets used (as a refresh of R2 would).
+          await tx.refreshToken.update({ where: { id: r2Row.id }, data: { rotatedAt: new Date() } });
+        },
+        { timeout: 20_000 },
+      );
+      await expect(loggingOut).resolves.toEqual({ success: true });
+
+      const session = await prisma.authSession.findUniqueOrThrow({ where: { id: r2Row.sessionId! } });
+      expect(session.revokedAt).toBeNull(); // the revocation it had started was rolled back
+      expect(await prisma.auditLog.count({ where: { entityType: 'AuthSession' } })).toBe(0);
+    });
+
+    describe('legacy (session-less) token', () => {
+      async function insertLegacy(userId: number, raw: string) {
+        return prisma.refreshToken.create({
+          data: { userId, tokenHash: sha256(raw), expiresAt: new Date(Date.now() + 30 * DAY_MS) },
+        });
+      }
+
+      it('logout loses its first UPDATE to the concurrent first refresh (forced) and ends the session that refresh attached', async () => {
+        const user = await createUser(prisma, nextPhone());
+        const legacyRaw = 'c'.repeat(96);
+        const legacy = await insertLegacy(user.id, legacyRaw);
+        let outcome!: Promise<PromiseSettledResult<unknown>[]>;
+
+        await inRolledBackTransaction(prisma, async (tx) => {
+          // Stops the refresh at its successor INSERT — after it attached the
+          // session to the token and rotated it, still holding the token's row.
+          await tx.refreshToken.create({
+            data: {
+              userId: user.id,
+              parentId: legacy.id,
+              tokenHash: sha256('placeholder-legacy'),
+              expiresAt: new Date(Date.now() + DAY_MS),
+            },
+          });
+          const refreshing = refresh(legacyRaw);
+          await waitForLockWaiters(prisma, 'refresh_tokens', 1);
+          const loggingOut = auth.logout(legacyRaw); // reads it as live and session-less; its UPDATE waits on the row
+          await waitForLockWaiters(prisma, 'refresh_tokens', 2);
+          outcome = Promise.allSettled([refreshing, loggingOut]);
+        });
+        const [refreshed, loggedOut] = await outcome;
+
+        expect(refreshed.status).toBe('fulfilled');
+        expect(loggedOut).toEqual({ status: 'fulfilled', value: { success: true } });
+        const sessions = await prisma.authSession.findMany({ where: { userId: user.id } });
+        expect(sessions).toHaveLength(1); // no duplicate session
+        expect(sessions[0].revokedReason).toBe(SessionRevokedReason.LOGOUT);
+        expect(await liveTokens({ userId: user.id })).toBe(0);
+      });
+
+      it('unsynchronised first refresh + logout, 10 rounds: no live session or token, never two sessions', async () => {
+        for (let round = 0; round < 10; round++) {
+          const user = await createUser(prisma, nextPhone());
+          const legacyRaw = `${round}`.padStart(96, 'd');
+          await insertLegacy(user.id, legacyRaw);
+
+          await Promise.allSettled([refresh(legacyRaw), auth.logout(legacyRaw)]);
+
+          expect(await liveTokens({ userId: user.id })).toBe(0);
+          expect(await prisma.authSession.count({ where: { userId: user.id, revokedAt: null } })).toBe(0);
+          expect(await prisma.authSession.count({ where: { userId: user.id } })).toBeLessThanOrEqual(1);
+        }
+      });
+
+      it('logout of an untouched legacy token revokes just that token (it is the whole session)', async () => {
+        const user = await createUser(prisma, nextPhone());
+        const legacyRaw = 'e'.repeat(96);
+        await insertLegacy(user.id, legacyRaw);
+
+        await expect(auth.logout(legacyRaw)).resolves.toEqual({ success: true });
+
+        expect(await liveTokens({ userId: user.id })).toBe(0);
+        expect(await prisma.authSession.count()).toBe(0);
+        await expect(refresh(legacyRaw)).rejects.toThrow(UnauthorizedException);
+      });
     });
   });
 });

@@ -160,14 +160,14 @@ function createDb() {
         tokens.push(row);
         return row;
       },
-      findUnique: async ({ where }: { where: { tokenHash: string } }) => {
-        const row = tokens.find((t) => t.tokenHash === where.tokenHash);
-        return row ? { ...row, user: users.find((u) => u.id === row.userId) } : null;
+      findUnique: async ({ where }: { where: { tokenHash?: string; id?: number } }) => {
+        const row = tokens.find((t) => (where.tokenHash ? t.tokenHash === where.tokenHash : t.id === where.id));
+        return row ? { ...row, user: users.find((u) => u.id === row.userId), successor: tokens.find((t) => t.parentId === row.id) ?? null } : null;
       },
       findUniqueOrThrow: async ({ where }: { where: { id: number } }) => {
         const row = tokens.find((t) => t.id === where.id);
         if (!row) throw new Error('not found');
-        return row;
+        return { ...row, user: users.find((u) => u.id === row.userId), successor: tokens.find((t) => t.parentId === row.id) ?? null };
       },
       updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
         const hit = tokens.filter((t) => matches(t, where));
@@ -389,13 +389,24 @@ describe('Session security (Phase 15B, sessions since 15E.4b)', () => {
       expect(JSON.stringify(db.audit).includes(next.refreshToken)).toBe(false);
     });
 
-    it('logout with an already-rotated token ends nothing (15E.4b: no revocation from a stale token)', async () => {
+    it('logout with the token just rotated by an in-flight refresh (successor unused) ends the session', async () => {
+      const first = await auth.login({ phone: PHONE, password: 'old-password' });
+      const next = await auth.refresh({ refreshToken: first.refreshToken }); // the client never stores this
+
+      await expect(auth.logout(first.refreshToken)).resolves.toEqual({ success: true });
+      expect(db.sessions[0]).toEqual(expect.objectContaining({ revokedReason: 'LOGOUT', revokedAt: expect.any(Date) }));
+      await expect(auth.refresh({ refreshToken: next.refreshToken })).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('logout with a rotated token whose successor was already used ends nothing', async () => {
       const first = await auth.login({ phone: PHONE, password: 'old-password' });
       const next = await auth.refresh({ refreshToken: first.refreshToken });
+      const latest = await auth.refresh({ refreshToken: next.refreshToken }); // successor used
 
       await expect(auth.logout(first.refreshToken)).resolves.toEqual({ success: true });
       expect(db.sessions[0].revokedAt).toBeNull();
-      await expect(auth.refresh({ refreshToken: next.refreshToken })).resolves.toBeDefined();
+      expect(db.audit).toHaveLength(0);
+      await expect(auth.refresh({ refreshToken: latest.refreshToken })).resolves.toBeDefined();
     });
   });
 });

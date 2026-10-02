@@ -1,5 +1,5 @@
 import { JwtService } from '@nestjs/jwt';
-import { PrismaClient, UserRole } from '@prisma/client';
+import { Prisma, PrismaClient, UserRole } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { AuthService } from '../../src/auth/auth.service';
 import { AdminService } from '../../src/admin/admin.service';
@@ -90,6 +90,29 @@ export async function raceAtSessionLock<T>(
     { timeout: 20_000 },
   );
   return started;
+}
+
+/**
+ * Runs `body` in a transaction that is then ROLLED BACK — for holding a lock or
+ * an uncommitted row (which blocks a competing INSERT on a unique key) while
+ * other transactions are started and observed waiting on it.
+ */
+export async function inRolledBackTransaction(
+  prisma: PrismaClient,
+  body: (tx: Prisma.TransactionClient) => Promise<void>,
+): Promise<void> {
+  const release = new Error('release');
+  await prisma
+    .$transaction(
+      async (tx) => {
+        await body(tx);
+        throw release;
+      },
+      { timeout: 20_000 },
+    )
+    .catch((error) => {
+      if (error !== release) throw error;
+    });
 }
 
 export async function waitForLockWaiters(prisma: PrismaClient, table: string, expected: number): Promise<void> {

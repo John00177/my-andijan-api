@@ -31,6 +31,7 @@ import { auditRequestFields } from '../common/request-context/request-context';
 import { capabilitiesFor } from '../authz/capabilities';
 import {
   ABSOLUTE_SESSION_TTL_MS,
+  isWithinRefreshGraceWindow,
   legacySessionExpiry,
   refreshTokenExpiry,
   revokeAllUserSessions,
@@ -73,6 +74,32 @@ type SessionUser = Pick<User, 'id' | 'phone' | 'role' | 'sessionVersion'>;
 
 /** Thrown inside a refresh transaction to roll ALL of it back; becomes the generic 401. */
 class RefreshRejected extends Error {}
+
+/** Thrown inside a logout transaction to roll back a revocation the token is not entitled to. */
+class LogoutNotEntitled extends Error {}
+
+const LOGOUT_TOKEN_SELECT = Prisma.validator<Prisma.RefreshTokenSelect>()({
+  id: true,
+  sessionId: true,
+  rotatedAt: true,
+  revokedAt: true,
+  expiresAt: true,
+  successor: { select: { rotatedAt: true } },
+  user: { select: { id: true, role: true } },
+});
+
+/**
+ * May this token end its session (see AuthService.logout)? The current token
+ * may; a rotated one only inside the grace window with its successor unused.
+ * A token revoked without rotation (logout, reset, suspension) or expired may not.
+ */
+function mayEndSession(
+  token: Prisma.RefreshTokenGetPayload<{ select: typeof LOGOUT_TOKEN_SELECT }>,
+  now: Date,
+): boolean {
+  if (token.rotatedAt) return isWithinRefreshGraceWindow(token, token.successor, now);
+  return token.revokedAt === null && token.expiresAt > now;
+}
 
 @Injectable()
 export class AuthService {
@@ -276,69 +303,92 @@ export class AuthService {
 
   /**
    * Ends the whole session the presented refresh token belongs to (Phase
-   * 15E.4b). Possession of the session's CURRENT refresh token is the proof —
-   * no access token is needed, so sign-out works after the access token has
-   * expired. A token that is unknown, expired, revoked or already rotated
-   * ends nothing (an old token must not be enough to end someone's session;
-   * what a replayed rotated token should trigger is decided in 15E.4c). The
+   * 15E.4b). Possession of the token is the proof — no access token is
+   * needed, so sign-out works after the access token has expired. The
    * response is the same in every case.
+   *
+   * The token may end its session only while it is:
+   *   - the session's CURRENT token (not rotated, not revoked, not expired), or
+   *   - its immediate predecessor, rotated within the refresh grace window and
+   *     with the successor still unused. That is the client signing out while
+   *     its own refresh was in flight: the server has already rotated, but the
+   *     client never stored (and now discards) the successor. Refusing would
+   *     leave that successor and its session alive after "logout".
+   * Any older token — rotated longer ago, or whose successor has been used —
+   * ends nothing: an old token must not be enough to end someone's session,
+   * and what a replayed token should trigger is decided in 15E.4c.
    */
   async logout(refreshToken: string) {
     const tokenHash = this.hashToken(refreshToken);
     const now = new Date();
+    try {
+      await this.prisma.$transaction((tx) => this.endSessionOnLogout(tx, tokenHash, now));
+    } catch (error) {
+      if (!(error instanceof LogoutNotEntitled)) throw error;
+    }
+    return { success: true };
+  }
 
-    await this.prisma.$transaction(async (tx) => {
-      const presented = await tx.refreshToken.findUnique({
-        where: { tokenHash },
-        select: {
-          id: true,
-          sessionId: true,
-          rotatedAt: true,
-          revokedAt: true,
-          expiresAt: true,
-          user: { select: { id: true, role: true } },
-        },
-      });
-      if (!presented || presented.rotatedAt || presented.revokedAt || presented.expiresAt <= now) return;
+  private async endSessionOnLogout(tx: Prisma.TransactionClient, tokenHash: string, now: Date): Promise<void> {
+    const presented = await tx.refreshToken.findUnique({ where: { tokenHash }, select: LOGOUT_TOKEN_SELECT });
+    // Unlocked, a "no" is already final: entitlement only ever runs out
+    // (time passes, a successor gets used), so nothing can make it "yes" again.
+    // Judged on a clock read AFTER the token: a refresh that committed just
+    // before stamped rotatedAt with its own, possibly later, `now`.
+    if (!presented || !mayEndSession(presented, new Date())) return;
 
-      if (presented.sessionId === null) {
-        // Legacy token, no session yet: it is the whole session.
-        await tx.refreshToken.updateMany({ where: { id: presented.id, revokedAt: null }, data: { revokedAt: now } });
-        return;
-      }
-
-      // Session row first (it waits for a refresh in flight), then its tokens —
-      // in a fresh snapshot that includes a successor that refresh committed.
-      const session = await tx.authSession.updateMany({
-        where: { id: presented.sessionId, revokedAt: null },
-        data: { revokedAt: now, revokedReason: SessionRevokedReason.LOGOUT },
-      });
-      const tokens = await tx.refreshToken.updateMany({
-        where: { sessionId: presented.sessionId, revokedAt: null },
+    let sessionId = presented.sessionId;
+    if (sessionId === null) {
+      // Legacy token, no session yet: it is the whole session.
+      const revoked = await tx.refreshToken.updateMany({
+        where: { id: presented.id, sessionId: null, revokedAt: null, expiresAt: { gt: now } },
         data: { revokedAt: now },
       });
-      if (session.count === 1) {
-        await tx.auditLog.create({
-          data: {
-            ...auditRequestFields(),
-            actorId: presented.user.id,
-            actorRole: presented.user.role,
-            action: AuditAction.UPDATE,
-            entityType: 'AuthSession',
-            entityId: presented.sessionId,
-            before: { revoked: false } as Prisma.InputJsonValue,
-            after: {
-              revoked: true,
-              reason: SessionRevokedReason.LOGOUT,
-              tokensRevoked: tokens.count,
-            } as Prisma.InputJsonValue,
-            note: 'Signed out',
-          },
-        });
-      }
-    });
+      if (revoked.count === 1) return;
+      // Lost to its concurrent first refresh. That UPDATE waited for the
+      // refresh to commit, so this fresh read sees the session it attached
+      // (the token is now rotated); end that session below. Nothing attached
+      // (revoked or expired instead) → nothing to end.
+      const attached = await tx.refreshToken.findUnique({ where: { id: presented.id }, select: { sessionId: true } });
+      if (!attached?.sessionId) return;
+      sessionId = attached.sessionId;
+    }
 
-    return { success: true };
+    // Lock and revoke the session row first: a refresh in flight on this
+    // session finishes before we continue (lock order: session, then tokens).
+    const session = await tx.authSession.updateMany({
+      where: { id: sessionId, revokedAt: null },
+      data: { revokedAt: now, revokedReason: SessionRevokedReason.LOGOUT },
+    });
+    if (session.count !== 1) return; // already revoked
+
+    // Decide under the lock, on a fresh clock: the token may have been rotated,
+    // and its successor used, while we waited. Not entitled → roll back.
+    const current = await tx.refreshToken.findUniqueOrThrow({ where: { id: presented.id }, select: LOGOUT_TOKEN_SELECT });
+    if (!mayEndSession(current, new Date())) throw new LogoutNotEntitled();
+
+    // A fresh snapshot: includes any successor the waited-for refresh committed.
+    const tokens = await tx.refreshToken.updateMany({
+      where: { sessionId, revokedAt: null },
+      data: { revokedAt: now },
+    });
+    await tx.auditLog.create({
+      data: {
+        ...auditRequestFields(),
+        actorId: presented.user.id,
+        actorRole: presented.user.role,
+        action: AuditAction.UPDATE,
+        entityType: 'AuthSession',
+        entityId: sessionId,
+        before: { revoked: false } as Prisma.InputJsonValue,
+        after: {
+          revoked: true,
+          reason: SessionRevokedReason.LOGOUT,
+          tokensRevoked: tokens.count,
+        } as Prisma.InputJsonValue,
+        note: 'Signed out',
+      },
+    });
   }
 
   // ============================================================================
