@@ -26,6 +26,7 @@ import { SmsService } from '../sms/sms.service';
 import { UploadService } from '../upload/upload.service';
 import { JwtPayload } from './strategies/jwt.strategy';
 import { auditRequestFields } from '../common/request-context/request-context';
+import { capabilitiesFor } from '../authz/capabilities';
 
 const BCRYPT_ROUNDS = 12;
 const RESET_CODE_TTL_MINUTES = 15;
@@ -484,8 +485,10 @@ export class AuthService {
     return new Date(base.getTime() + value * unitMs[unit]);
   }
 
-  private sanitizeUser<T extends { passwordHash: string }>(user: T) {
+  // Every auth response carries the user's capabilities (D-75) so the
+  // frontend can render immediately after sign-in. Display hint only.
+  private sanitizeUser<T extends { passwordHash: string; role: UserRole }>(user: T) {
     const { passwordHash, ...rest } = user;
-    return rest;
+    return { ...rest, capabilities: capabilitiesFor(user.role) };
   }
 }

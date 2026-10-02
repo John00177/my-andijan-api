@@ -5,7 +5,7 @@ import { AdminService } from './admin.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReviewsService } from '../reviews/reviews.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
-import { assertCanChangeUserStatus, REACTIVATABLE_TARGETS, SUSPENDABLE_TARGETS } from './user-status.policy';
+import { assertCanChangeUserStatus, REACTIVATABLE_TARGETS, SUSPENDABLE_TARGETS } from '../authz/user-status.policy';
 
 // Phase 15B (D-74): who may suspend / reinstate whom. The expected tables
 // below are written out by hand — deliberately NOT derived from the policy

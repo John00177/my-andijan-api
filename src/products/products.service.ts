@@ -1,4 +1,5 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
+import { assertOwnsBusiness } from '../authz/policies';
 import { BusinessStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
@@ -54,7 +55,7 @@ export class ProductsService {
   // filled in before approval.
   async findForOwner(businessId: number, user: AuthenticatedUser) {
     const business = await this.getBusinessOrThrow(businessId);
-    this.assertOwner(business, user);
+    assertOwnsBusiness(business, user);
 
     return this.prisma.product.findMany({
       where: { businessId, deletedAt: null },
@@ -64,7 +65,7 @@ export class ProductsService {
 
   async create(businessId: number, user: AuthenticatedUser, dto: CreateMenuItemDto) {
     const business = await this.getBusinessOrThrow(businessId);
-    this.assertOwner(business, user);
+    assertOwnsBusiness(business, user);
 
     const slug = await this.generateUniqueSlug(businessId, dto.name);
     if (dto.categoryId != null) await this.assertCategoryExists(dto.categoryId);
@@ -119,7 +120,7 @@ export class ProductsService {
     if (!product) {
       throw new NotFoundException(`Menu item ${id} not found`);
     }
-    this.assertOwner(product.business, user);
+    assertOwnsBusiness(product.business, user);
     return product;
   }
 
@@ -140,15 +141,6 @@ export class ProductsService {
     return business;
   }
 
-  // Ownership only, same rule as BusinessesService (Phase 15B, D-74). The old
-  // "owner OR rank >= MODERATOR" bypass let any moderator rewrite any
-  // catalog. Cross-business catalog editing by ADMIN is not offered at all
-  // until the capability phase decides whether it is wanted (15C open #9).
-  private assertOwner(business: { ownerId: number | null }, user: AuthenticatedUser) {
-    if (business.ownerId === null || business.ownerId !== user.id) {
-      throw new ForbiddenException('You do not have permission to manage this menu');
-    }
-  }
 
   private async generateUniqueSlug(businessId: number, name: string): Promise<string> {
     const base = slugify(name) || 'item';

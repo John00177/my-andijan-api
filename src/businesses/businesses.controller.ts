@@ -10,10 +10,8 @@ import {
   Post,
   Put,
   Query,
-  UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { UserRole } from '@prisma/client';
 import { BusinessesService } from './businesses.service';
 import { ListBusinessesQueryDto } from './dto/list-businesses-query.dto';
 import { CreateBusinessDto } from './dto/create-business.dto';
@@ -21,11 +19,9 @@ import { UpdateBusinessDto } from './dto/update-business.dto';
 import { BusinessHourInputDto } from './dto/update-business-hours.dto';
 import { ReviewsService } from '../reviews/reviews.service';
 import { CreateBusinessReviewDto } from '../reviews/dto/create-business-review.dto';
-import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { RolesGuard } from '../common/guards/roles.guard';
-import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+import { Public, RequireCapability } from '../authz/authz.decorators';
 
 @ApiTags('businesses')
 @Controller('businesses')
@@ -40,8 +36,7 @@ export class BusinessesController {
   // PENDING; the submitter's role is untouched until an admin/moderator
   // approves it (see AdminService.approveBusiness).
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.CUSTOMER, UserRole.BUSINESS_OWNER, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @RequireCapability('business.create')
   @Post()
   create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateBusinessDto) {
     return this.businessesService.createForOwner(user, dto);
@@ -52,18 +47,17 @@ export class BusinessesController {
   // moderation; this is the one irreversible action in the business
   // lifecycle, deliberately withheld from ADMIN and MODERATOR too.
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.SUPER_ADMIN)
+  @RequireCapability('business.delete')
   @Delete(':id')
   remove(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
     return this.businessesService.remove(id, admin.id);
   }
 
-  // Owner-only (Phase 15B, D-74): authentication here, OWNERSHIP in the
-  // service, and deliberately no @Roles — a rank floor is what used to let
-  // SUPPORT/MODERATOR through. Staff edits go via PATCH /admin/businesses/:id.
+  // `business.manage_own` + OWNERSHIP in the service (D-74/D-75). SUPPORT and
+  // MODERATOR hold no owner capability; staff edit other owners' listings via
+  // PATCH /admin/businesses/:id (`business.edit_any`).
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard)
+  @RequireCapability('business.manage_own')
   @Patch(':id')
   update(
     @Param('id', ParseIntPipe) id: number,
@@ -77,7 +71,7 @@ export class BusinessesController {
   // wholesale (delete-then-create) from a plain array body. Staff use
   // PUT /admin/businesses/:id/hours.
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard)
+  @RequireCapability('business.manage_own')
   @Put(':id/hours')
   updateHours(
     @Param('id', ParseIntPipe) id: number,
@@ -88,22 +82,26 @@ export class BusinessesController {
   }
 
   // Must be declared before ':id' so these literals aren't swallowed as an id/slug.
+  @Public()
   @Get('featured')
   findFeatured() {
     return this.businessesService.findFeatured();
   }
 
+  @Public()
   @Get('promoted')
   findPromoted() {
     return this.businessesService.findPromoted();
   }
 
+  @Public()
   @Get()
   findAll(@Query() query: ListBusinessesQueryDto) {
     return this.businessesService.findAll(query);
   }
 
   // Accepts either a numeric id or a slug (see BusinessesService.findOne).
+  @Public()
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.businessesService.findOne(id);
@@ -113,6 +111,7 @@ export class BusinessesController {
   // ReviewsService.findForBusiness for why (reviews are branch-scoped in
   // storage, but a caller reading/writing "the business's reviews" shouldn't
   // need a branch id).
+  @Public()
   @Get(':id/reviews')
   findReviews(@Param('id', ParseIntPipe) id: number) {
     return this.reviewsService.findForBusiness(id);
@@ -123,8 +122,7 @@ export class BusinessesController {
   // constraint (inherited from ReviewsService.create) is the anti-spam
   // control, not a role gate.
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.CUSTOMER, UserRole.BUSINESS_OWNER, UserRole.MODERATOR, UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @RequireCapability('review.write')
   @Post(':id/reviews')
   createReview(
     @Param('id', ParseIntPipe) id: number,

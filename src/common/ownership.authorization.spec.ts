@@ -1,6 +1,4 @@
 import { ForbiddenException } from '@nestjs/common';
-import { GUARDS_METADATA } from '@nestjs/common/constants';
-import { Reflector } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
 import { AuditAction, UserRole } from '@prisma/client';
 import { BusinessesController } from '../businesses/businesses.controller';
@@ -12,8 +10,7 @@ import { AdminService } from '../admin/admin.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { OwnerService } from '../owner/owner.service';
 import { HealthScoreService } from '../health-score/health-score.service';
-import { JwtAuthGuard } from './guards/jwt-auth.guard';
-import { ROLES_KEY } from './decorators/roles.decorator';
+import { decide, ruleOf } from '../authz/decide';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { runWithRequestContext } from './request-context/request-context';
 
@@ -34,8 +31,7 @@ const OWNER_ID = 7;
 const OTHER_ID = 30;
 const as = (role: UserRole, id = OTHER_ID): AuthenticatedUser => ({ id, phone: `+99890000${id}`, role });
 
-describe('Owner-only routes carry no role floor', () => {
-  const reflector = new Reflector();
+describe('Owner routes require business.manage_own (ownership checked in the service)', () => {
   const routes: Array<[string, new (...args: never[]) => unknown, (...args: never[]) => unknown]> = [
     ['PATCH /businesses/:id', BusinessesController, BusinessesController.prototype.update],
     ['PUT /businesses/:id/hours', BusinessesController, BusinessesController.prototype.updateHours],
@@ -44,9 +40,15 @@ describe('Owner-only routes carry no role floor', () => {
     ['PATCH /reviews/:id/reply', ReviewsController, ReviewsController.prototype.replyPatch],
   ];
 
-  it.each(routes)('%s: JwtAuthGuard only, no @Roles (SUPPORT cannot ride a rank floor in)', (_r, controller, handler) => {
-    expect(Reflect.getMetadata(GUARDS_METADATA, handler)).toEqual([JwtAuthGuard]);
-    expect(reflector.getAllAndOverride(ROLES_KEY, [handler, controller])).toBeUndefined();
+  it.each(routes)('%s requires exactly business.manage_own', (_r, controller, handler) => {
+    expect(ruleOf(controller, handler)).toEqual({ kind: 'capability', capabilities: ['business.manage_own'] });
+  });
+
+  it.each(routes)('%s: SUPPORT, MODERATOR and CUSTOMER are refused at the route — no owner capability (D-75)', (_r, controller, handler) => {
+    const rule = ruleOf(controller, handler);
+    for (const role of [UserRole.SUPPORT, UserRole.MODERATOR, UserRole.CUSTOMER]) expect(decide(rule, role)).toBe('forbidden');
+    for (const role of [UserRole.BUSINESS_OWNER, UserRole.ADMIN, UserRole.SUPER_ADMIN]) expect(decide(rule, role)).toBe('allow');
+    expect(decide(rule, null)).toBe('unauthenticated');
   });
 });
 

@@ -25,11 +25,11 @@ import { RefreshDto } from './dto/refresh.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { VerifyResetCodeDto } from './dto/verify-reset-code.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
-import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from './strategies/jwt.strategy';
 import { SkipThrottle, Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { AUTH_LIMITS } from './auth-throttle';
+import { Public, Authenticated } from '../authz/authz.decorators';
 
 // Every credential / SMS-code route is rate limited (Phase 15B) — per client
 // address and per target phone; limits and rationale in auth-throttle.ts.
@@ -41,6 +41,7 @@ export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @Throttle(AUTH_LIMITS.register)
+  @Public()
   @Post('register')
   register(@Body() dto: RegisterDto) {
     return this.authService.register(dto);
@@ -48,6 +49,7 @@ export class AuthController {
 
   @Throttle(AUTH_LIMITS.login)
   @HttpCode(HttpStatus.OK)
+  @Public()
   @Post('login')
   login(@Body() dto: LoginDto) {
     return this.authService.login(dto);
@@ -57,6 +59,7 @@ export class AuthController {
   @Throttle(AUTH_LIMITS.refresh)
   @SkipThrottle({ phone: true })
   @HttpCode(HttpStatus.OK)
+  @Public()
   @Post('refresh')
   refresh(@Body() dto: RefreshDto) {
     return this.authService.refresh(dto);
@@ -64,8 +67,8 @@ export class AuthController {
 
   @SkipThrottle({ ip: true, phone: true })
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
+  @Authenticated()
   @Post('logout')
   logout(@Body() dto: RefreshDto, @CurrentUser() _user: AuthenticatedUser) {
     return this.authService.logout(dto.refreshToken);
@@ -73,6 +76,7 @@ export class AuthController {
 
   @Throttle(AUTH_LIMITS.otpRequest)
   @HttpCode(HttpStatus.OK)
+  @Public()
   @Post('otp/request')
   requestOtp(@Body() dto: RequestOtpDto) {
     return this.authService.requestOtp(dto);
@@ -80,6 +84,7 @@ export class AuthController {
 
   @Throttle(AUTH_LIMITS.otpVerify)
   @HttpCode(HttpStatus.OK)
+  @Public()
   @Post('otp/verify')
   verifyOtp(@Body() dto: VerifyOtpDto) {
     return this.authService.verifyOtp(dto);
@@ -88,7 +93,7 @@ export class AuthController {
   @SkipThrottle({ ip: true, phone: true })
   @ApiBearerAuth()
   @ApiConsumes('multipart/form-data')
-  @UseGuards(JwtAuthGuard)
+  @Authenticated()
   @Put('profile')
   @UseInterceptors(
     FileInterceptor('photo', {
@@ -113,6 +118,7 @@ export class AuthController {
 
   @Throttle(AUTH_LIMITS.forgotPassword)
   @HttpCode(HttpStatus.OK)
+  @Public()
   @Post('forgot-password')
   forgotPassword(@Body() dto: ForgotPasswordDto) {
     return this.authService.forgotPassword(dto);
@@ -120,6 +126,7 @@ export class AuthController {
 
   @Throttle(AUTH_LIMITS.verifyResetCode)
   @HttpCode(HttpStatus.OK)
+  @Public()
   @Post('verify-reset-code')
   verifyResetCode(@Body() dto: VerifyResetCodeDto) {
     return this.authService.verifyResetCode(dto);
@@ -127,6 +134,7 @@ export class AuthController {
 
   @Throttle(AUTH_LIMITS.resetPassword)
   @HttpCode(HttpStatus.OK)
+  @Public()
   @Post('reset-password')
   resetPassword(@Body() dto: ResetPasswordDto) {
     return this.authService.resetPassword(dto);

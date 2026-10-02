@@ -1,4 +1,4 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { AuditAction, BusinessStatus, EventStatus, Prisma, ReviewStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { OwnerService } from '../owner/owner.service';
@@ -6,6 +6,7 @@ import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { auditRequestFields } from '../common/request-context/request-context';
 import { ListBusinessesQueryDto } from './dto/list-businesses-query.dto';
 import { replacePrimaryBranchHours } from './business-hours';
+import { assertNotOwnBusiness, assertOwnsBusiness } from '../authz/policies';
 import { CreateBusinessDto } from './dto/create-business.dto';
 import { UpdateBusinessDto } from './dto/update-business.dto';
 import { BusinessHourInputDto } from './dto/update-business-hours.dto';
@@ -263,7 +264,7 @@ export class BusinessesService {
 
   async update(id: number, user: AuthenticatedUser, dto: UpdateBusinessDto) {
     const business = await this.getBusinessOrThrow(id);
-    this.assertOwner(business, user);
+    assertOwnsBusiness(business, user);
 
     if (dto.categoryId != null) {
       const category = await this.prisma.category.findFirst({ where: { id: dto.categoryId, deletedAt: null } });
@@ -282,7 +283,7 @@ export class BusinessesService {
 
   async updateHours(id: number, user: AuthenticatedUser, hours: BusinessHourInputDto[]) {
     const business = await this.getBusinessOrThrow(id);
-    this.assertOwner(business, user);
+    assertOwnsBusiness(business, user);
 
     return this.prisma.$transaction(async (tx) => (await replacePrimaryBranchHours(tx, id, hours)).after);
   }
@@ -295,14 +296,6 @@ export class BusinessesService {
     return business;
   }
 
-  // Ownership is the whole check — no role bypass (Phase 15B removed the old
-  // "owner OR rank >= MODERATOR" rule, which let moderators edit any listing).
-  private assertOwner(business: { ownerId: number | null }, user: AuthenticatedUser) {
-    if (business.ownerId === null || business.ownerId !== user.id) {
-      throw new ForbiddenException('You do not have permission to manage this business');
-    }
-  }
-
   // Soft delete, consistent with every other entity in this schema — a
   // SUPER_ADMIN can always be un-done via direct DB access, but nothing here
   // exposes an undelete endpoint since the action is meant to stay rare and
@@ -313,6 +306,8 @@ export class BusinessesService {
       if (!business) {
         throw new NotFoundException(`Business ${id} not found`);
       }
+      // Conflict of interest (D-75): nobody deletes a listing they own this way.
+      assertNotOwnBusiness(business, { id: adminId });
 
       const updated = await tx.business.update({
         where: { id },

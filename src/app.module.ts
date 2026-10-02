@@ -1,4 +1,6 @@
 import { Module } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
+import { AuthzGuard } from './authz/authz.guard';
 import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
@@ -37,5 +39,8 @@ import { UploadModule } from './upload/upload.module';
     ProductsModule,
     UploadModule,
   ],
+  // Global, deny-by-default authorization (Phase 15D, D-75): every route must
+  // declare @Public / @Authenticated / @RequireCapability or it is refused.
+  providers: [{ provide: APP_GUARD, useClass: AuthzGuard }],
 })
 export class AppModule {}

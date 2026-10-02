@@ -2,6 +2,7 @@ import { ConflictException, Injectable, NotFoundException } from '@nestjs/common
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
+import { capabilitiesFor } from '../authz/capabilities';
 
 const PROFILE_SELECT = {
   id: true,
@@ -24,7 +25,10 @@ export class UsersService {
   // truth on app mount, instead of only ever trusting whatever got written
   // to localStorage at login/last save.
   async getMe(userId: number) {
-    return this.prisma.user.findUniqueOrThrow({ where: { id: userId }, select: PROFILE_SELECT });
+    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId }, select: PROFILE_SELECT });
+    // The caller's capabilities (D-75), so the frontend can render from them.
+    // A display hint only — every route enforces its own rule server-side.
+    return { ...user, capabilities: capabilitiesFor(user.role) };
   }
 
   async updateMe(userId: number, dto: UpdateProfileDto) {

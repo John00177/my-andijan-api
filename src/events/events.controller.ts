@@ -1,39 +1,40 @@
-import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { EventsService } from './events.service';
 import { ListEventsQueryDto } from './dto/list-events-query.dto';
 import { CreateEventDto } from './dto/create-event.dto';
-import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+import { Public, Authenticated, RequireCapability } from '../authz/authz.decorators';
 
 @ApiTags('events')
 @Controller('events')
 export class EventsController {
   constructor(private readonly eventsService: EventsService) {}
 
+  @Public()
   @Get()
   findAll(@Query() query: ListEventsQueryDto) {
     return this.eventsService.findAll(query);
   }
 
-  // Owner-only (Phase 15B, D-74): EventsService.create requires that the
-  // caller owns the business. No @Roles floor — it let SUPPORT/MODERATOR in
-  // by rank while adding nothing the ownership check doesn't already enforce.
+  // `business.manage_own` + OWNERSHIP: EventsService.create requires that the
+  // caller owns the business (D-74/D-75).
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard)
+  @RequireCapability('business.manage_own')
   @Post()
   create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateEventDto) {
     return this.eventsService.create(user, dto);
   }
 
+  @Public()
   @Get(':slug')
   findBySlug(@Param('slug') slug: string) {
     return this.eventsService.findBySlug(slug);
   }
 
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard)
+  @Authenticated()
   @Post(':slug/attend')
   attend(@Param('slug') slug: string, @CurrentUser() user: AuthenticatedUser) {
     return this.eventsService.attend(slug, user.id);

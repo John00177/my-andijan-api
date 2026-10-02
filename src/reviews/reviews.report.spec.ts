@@ -1,7 +1,6 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
-import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { Test } from '@nestjs/testing';
-import { BusinessStatus, Prisma, ReportReason, ReviewStatus } from '@prisma/client';
+import { BusinessStatus, Prisma, ReportReason, ReviewStatus, UserRole } from '@prisma/client';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { ReviewsService } from './reviews.service';
@@ -9,8 +8,7 @@ import { ReviewsController } from './reviews.controller';
 import { CreateReviewReportDto } from './dto/create-review-report.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { HealthScoreService } from '../health-score/health-score.service';
-import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { ROLES_KEY } from '../common/decorators/roles.decorator';
+import { decide, ruleOf } from '../authz/decide';
 
 describe('Review reporting (POST /reviews/:id/report)', () => {
   let service: ReviewsService;
@@ -127,13 +125,15 @@ describe('Review reporting (POST /reviews/:id/report)', () => {
   });
 
   describe('route authorization', () => {
-    it('requires an authenticated user (JwtAuthGuard) — anonymous requests get 401', () => {
-      expect(Reflect.getMetadata(GUARDS_METADATA, ReviewsController.prototype.report)).toEqual([JwtAuthGuard]);
+    const rule = ruleOf(ReviewsController, ReviewsController.prototype.report);
+
+    it('requires the review.report capability (D-75) — anonymous requests get 401', () => {
+      expect(rule).toEqual({ kind: 'capability', capabilities: ['review.report'] });
+      expect(decide(rule, null)).toBe('unauthenticated');
     });
 
-    it('has no role floor — any signed-in role may report, like writing a review', () => {
-      expect(Reflect.getMetadata(ROLES_KEY, ReviewsController.prototype.report)).toBeUndefined();
-      expect(Reflect.getMetadata(ROLES_KEY, ReviewsController)).toBeUndefined();
+    it.each(Object.values(UserRole))('lets every role report, like writing a review (%s)', (role) => {
+      expect(decide(rule, role)).toBe('allow');
     });
   });
 });

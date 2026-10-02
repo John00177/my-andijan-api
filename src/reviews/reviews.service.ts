@@ -2,6 +2,7 @@ import { ConflictException, ForbiddenException, Injectable, NotFoundException } 
 import { BusinessStatus, Prisma, ReviewStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { HealthScoreService } from '../health-score/health-score.service';
+import { assertOwnsBusiness } from '../authz/policies';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { CreateReviewDto } from './dto/create-review.dto';
 import { CreateBusinessReviewDto } from './dto/create-business-review.dto';
@@ -179,10 +180,7 @@ export class ReviewsService {
     // Owner only (Phase 15B, D-74). A reply is displayed as the business
     // speaking, so no staff role may author one on a business it doesn't own —
     // the old "rank >= MODERATOR" bypass let moderators answer as any business.
-    const ownerId = review.branch.business.ownerId;
-    if (ownerId === null || ownerId !== user.id) {
-      throw new ForbiddenException('Only the owner of this business can reply to this review');
-    }
+    assertOwnsBusiness(review.branch.business, user, 'Only the owner of this business can reply to this review');
 
     try {
       const created = await this.prisma.reviewReply.create({

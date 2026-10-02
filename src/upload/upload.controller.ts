@@ -3,14 +3,13 @@ import {
   Controller,
   Post,
   UploadedFile,
-  UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { ApiConsumes, ApiBody } from '@nestjs/swagger';
 import { UploadService } from './upload.service';
-import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { Authenticated } from '../authz/authz.decorators';
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB — matches the frontend's own stated limit.
 const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
@@ -27,7 +26,7 @@ export class UploadController {
   @ApiBearerAuth()
   @ApiConsumes('multipart/form-data')
   @ApiBody({ schema: { type: 'object', properties: { file: { type: 'string', format: 'binary' } } } })
-  @UseGuards(JwtAuthGuard)
+  @Authenticated()
   @Post('image')
   @UseInterceptors(
     FileInterceptor('file', {

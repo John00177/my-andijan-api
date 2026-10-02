@@ -18,7 +18,7 @@ export class UploadService {
     // browser-to-Supabase calls under RLS, and this backend has no Supabase
     // Auth session for RLS to authorize. service_role bypasses RLS
     // entirely, which is the correct trust boundary for a backend that's
-    // already the one deciding (via JwtAuthGuard) who's allowed to upload.
+    // already the one deciding (via the global AuthzGuard) who's allowed to upload.
     const key = process.env.SUPABASE_SERVICE_KEY;
     if (!url || !key) {
       throw new InternalServerErrorException('Image upload is not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)');

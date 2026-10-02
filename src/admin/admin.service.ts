@@ -39,7 +39,14 @@ import { auditRequestFields } from '../common/request-context/request-context';
 import { replacePrimaryBranchHours } from '../businesses/business-hours';
 import { BusinessHourInputDto } from '../businesses/dto/update-business-hours.dto';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
-import { assertCanChangeUserStatus, isEmergencyFreeze } from './user-status.policy';
+import { assertCanChangeUserStatus, isEmergencyFreeze } from '../authz/user-status.policy';
+import { hasCapability } from '../authz/capabilities';
+import {
+  assertNotOwnBusiness,
+  assertNotOwnClaim,
+  assertNotOwnReportMatter,
+  assertNotOwnReviewMatter,
+} from '../authz/policies';
 
 function slugify(input: string): string {
   return input
@@ -49,12 +56,11 @@ function slugify(input: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
-// ADMIN and SUPER_ADMIN see PII that MODERATOR does not (D-72). An explicit
-// set rather than a rank comparison (Phase 15B): adding a role above ADMIN
-// must not silently widen who sees owner phone/email.
-const CONTACT_DETAIL_ROLES: ReadonlySet<UserRole> = new Set([UserRole.ADMIN, UserRole.SUPER_ADMIN]);
+// Contact details (owner phone/email, reporter names) are shaped by the
+// `user.pii.read` capability (D-72, D-75): MODERATOR lacks it, ADMIN and
+// SUPER_ADMIN hold it — by the explicit table, not by rank.
 function canSeeContactDetails(role: UserRole): boolean {
-  return CONTACT_DETAIL_ROLES.has(role);
+  return hasCapability(role, 'user.pii.read');
 }
 
 function paginate(page: number, limit: number, total: number) {
@@ -184,7 +190,7 @@ export class AdminService {
 
   async approveBusiness(id: number, adminId: number) {
     return this.prisma.$transaction(async (tx) => {
-      const business = await this.getPendingBusiness(tx, id);
+      const business = await this.getPendingBusiness(tx, id, adminId);
 
       // Compare-and-set: approve and reject are now open to every MODERATOR,
       // so two moderators acting on the same listing must not both win.
@@ -254,6 +260,7 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
       if (!business) throw new NotFoundException(`Business ${id} not found`);
+      assertNotOwnBusiness(business, { id: adminId });
 
       if (changed.categoryId != null) {
         const category = await tx.category.findFirst({ where: { id: changed.categoryId, deletedAt: null } });
@@ -287,6 +294,7 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
       if (!business) throw new NotFoundException(`Business ${id} not found`);
+      assertNotOwnBusiness(business, { id: adminId });
 
       const { branchId, before, after } = await replacePrimaryBranchHours(tx, id, hours);
       const summarize = (rows: typeof before) =>
@@ -315,6 +323,10 @@ export class AdminService {
 
   async updateBusinessBranch(id: number, adminId: number, dto: UpdateBusinessBranchDto) {
     return this.prisma.$transaction(async (tx) => {
+      const business = await tx.business.findFirst({ where: { id, deletedAt: null }, select: { ownerId: true } });
+      if (!business) throw new NotFoundException(`Business ${id} not found`);
+      assertNotOwnBusiness(business, { id: adminId });
+
       const branch = await tx.branch.findFirst({
         where: { businessId: id, deletedAt: null },
         orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
@@ -355,6 +367,7 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
       if (!business) throw new NotFoundException(`Business ${id} not found`);
+      assertNotOwnBusiness(business, { id: adminId });
       if (business.status === BusinessStatus.HIDDEN) {
         throw new ConflictException(`Business ${id} is already hidden`);
       }
@@ -388,6 +401,7 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
       if (!business) throw new NotFoundException(`Business ${id} not found`);
+      assertNotOwnBusiness(business, { id: adminId });
       if (business.status !== BusinessStatus.HIDDEN) {
         throw new ConflictException(`Business ${id} is not hidden (current status: ${business.status})`);
       }
@@ -416,7 +430,7 @@ export class AdminService {
 
   async rejectBusiness(id: number, adminId: number, dto: RejectBusinessDto) {
     return this.prisma.$transaction(async (tx) => {
-      const business = await this.getPendingBusiness(tx, id);
+      const business = await this.getPendingBusiness(tx, id, adminId);
 
       const updated = await this.transitionBusiness(tx, id, BusinessStatus.PENDING, {
         status: BusinessStatus.REJECTED,
@@ -451,11 +465,13 @@ export class AdminService {
     return tx.business.findUniqueOrThrow({ where: { id } });
   }
 
-  private async getPendingBusiness(tx: Prisma.TransactionClient, id: number) {
+  private async getPendingBusiness(tx: Prisma.TransactionClient, id: number, actorId: number) {
     const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
     if (!business) {
       throw new NotFoundException(`Business ${id} not found`);
     }
+    // Conflict of interest (D-75): nobody approves or rejects their own listing.
+    assertNotOwnBusiness(business, { id: actorId });
     if (business.status !== BusinessStatus.PENDING) {
       throw new ConflictException(`Business ${id} is not pending review (current status: ${business.status})`);
     }
@@ -466,6 +482,7 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
       if (!business) throw new NotFoundException(`Business ${id} not found`);
+      assertNotOwnBusiness(business, { id: adminId });
       if (business.isVerified) throw new ConflictException(`Business ${id} is already verified`);
 
       const updated = await tx.business.update({
@@ -495,6 +512,7 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
       if (!business) throw new NotFoundException(`Business ${id} not found`);
+      assertNotOwnBusiness(business, { id: adminId });
       if (!business.isVerified) throw new ConflictException(`Business ${id} is not verified`);
 
       const updated = await tx.business.update({ where: { id }, data: { isVerified: false } });
@@ -515,6 +533,7 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
       if (!business) throw new NotFoundException(`Business ${id} not found`);
+      assertNotOwnBusiness(business, { id: adminId });
       if (business.status === BusinessStatus.SUSPENDED) {
         throw new ConflictException(`Business ${id} is already suspended`);
       }
@@ -549,6 +568,7 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
       if (!business) throw new NotFoundException(`Business ${id} not found`);
+      assertNotOwnBusiness(business, { id: adminId });
       if (business.status !== BusinessStatus.SUSPENDED) {
         throw new ConflictException(`Business ${id} is not suspended (current status: ${business.status})`);
       }
@@ -583,6 +603,7 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
       if (!business) throw new NotFoundException(`Business ${id} not found`);
+      assertNotOwnBusiness(business, { id: adminId });
 
       const updated = await tx.business.update({
         where: { id },
@@ -609,6 +630,7 @@ export class AdminService {
     return this.prisma.$transaction(async (tx) => {
       const business = await tx.business.findFirst({ where: { id, deletedAt: null } });
       if (!business) throw new NotFoundException(`Business ${id} not found`);
+      assertNotOwnBusiness(business, { id: adminId });
       if (!business.isPromoted) throw new ConflictException(`Business ${id} is not promoted`);
 
       const updated = await tx.business.update({
@@ -666,7 +688,7 @@ export class AdminService {
   // assigned without the claim being APPROVED, and vice versa.
   async approveClaim(id: number, adminId: number) {
     return this.prisma.$transaction(async (tx) => {
-      const claim = await this.getPendingClaim(tx, id);
+      const claim = await this.getPendingClaim(tx, id, adminId);
 
       const assigned = await tx.business.updateMany({
         where: { id: claim.businessId, ownerId: null },
@@ -748,7 +770,7 @@ export class AdminService {
 
   async rejectClaim(id: number, adminId: number, dto: RejectClaimDto) {
     return this.prisma.$transaction(async (tx) => {
-      const claim = await this.getPendingClaim(tx, id);
+      const claim = await this.getPendingClaim(tx, id, adminId);
 
       const updated = await this.transitionPendingClaim(tx, id, {
         status: ClaimStatus.REJECTED,
@@ -771,11 +793,13 @@ export class AdminService {
     });
   }
 
-  private async getPendingClaim(tx: Prisma.TransactionClient, id: number) {
+  private async getPendingClaim(tx: Prisma.TransactionClient, id: number, actorId: number) {
     const claim = await tx.businessClaim.findUnique({ where: { id } });
     if (!claim) {
       throw new NotFoundException(`Claim ${id} not found`);
     }
+    // Conflict of interest (D-75): nobody decides their own claim.
+    assertNotOwnClaim(claim, { id: actorId });
     if (claim.status !== ClaimStatus.PENDING) {
       throw new ConflictException(`Claim ${id} has already been reviewed (status: ${claim.status})`);
     }
@@ -840,8 +864,20 @@ export class AdminService {
 
   async resolveReport(id: number, adminId: number, dto: ResolveReportDto) {
     return this.prisma.$transaction(async (tx) => {
-      const report = await tx.reviewReport.findUnique({ where: { id }, include: { review: true } });
+      const report = await tx.reviewReport.findUnique({
+        where: { id },
+        include: { review: { include: { branch: { select: { business: { select: { ownerId: true } } } } } } },
+      });
       if (!report) throw new NotFoundException(`Report ${id} not found`);
+      // Conflict of interest (D-75): not a report you filed, about your review, or about your business.
+      assertNotOwnReportMatter(
+        {
+          reporterId: report.reporterId,
+          reviewAuthorId: report.review.userId,
+          businessOwnerId: report.review.branch?.business?.ownerId ?? null,
+        },
+        { id: adminId },
+      );
       if (report.status !== ReportStatus.PENDING) {
         throw new ConflictException(`Report ${id} has already been resolved (status: ${report.status})`);
       }
@@ -933,8 +969,16 @@ export class AdminService {
 
   async hideReview(id: number, adminId: number) {
     return this.prisma.$transaction(async (tx) => {
-      const review = await tx.review.findFirst({ where: { id, deletedAt: null } });
+      const review = await tx.review.findFirst({
+        where: { id, deletedAt: null },
+        include: { branch: { select: { business: { select: { ownerId: true } } } } },
+      });
       if (!review) throw new NotFoundException(`Review ${id} not found`);
+      // Conflict of interest (D-75): not your own review, not one about your business.
+      assertNotOwnReviewMatter(
+        { userId: review.userId, businessOwnerId: review.branch?.business?.ownerId ?? null },
+        { id: adminId },
+      );
       if (review.status === ReviewStatus.HIDDEN) throw new ConflictException(`Review ${id} is already hidden`);
 
       const updated = await this.transitionReview(tx, id, review.status, ReviewStatus.HIDDEN);
@@ -955,8 +999,16 @@ export class AdminService {
 
   async restoreReview(id: number, adminId: number) {
     return this.prisma.$transaction(async (tx) => {
-      const review = await tx.review.findFirst({ where: { id, deletedAt: null } });
+      const review = await tx.review.findFirst({
+        where: { id, deletedAt: null },
+        include: { branch: { select: { business: { select: { ownerId: true } } } } },
+      });
       if (!review) throw new NotFoundException(`Review ${id} not found`);
+      // Conflict of interest (D-75): not your own review, not one about your business.
+      assertNotOwnReviewMatter(
+        { userId: review.userId, businessOwnerId: review.branch?.business?.ownerId ?? null },
+        { id: adminId },
+      );
       if (review.status === ReviewStatus.PUBLISHED) {
         throw new ConflictException(`Review ${id} is already published`);
       }
@@ -1017,7 +1069,7 @@ export class AdminService {
 
   async approveEvent(id: number, adminId: number) {
     return this.prisma.$transaction(async (tx) => {
-      const event = await this.getPendingEvent(tx, id);
+      const event = await this.getPendingEvent(tx, id, adminId);
 
       const updated = await tx.event.update({
         where: { id },
@@ -1039,7 +1091,7 @@ export class AdminService {
 
   async rejectEvent(id: number, adminId: number, dto: RejectEventDto) {
     return this.prisma.$transaction(async (tx) => {
-      const event = await this.getPendingEvent(tx, id);
+      const event = await this.getPendingEvent(tx, id, adminId);
 
       const updated = await tx.event.update({
         where: { id },
@@ -1059,11 +1111,16 @@ export class AdminService {
     });
   }
 
-  private async getPendingEvent(tx: Prisma.TransactionClient, id: number) {
-    const event = await tx.event.findFirst({ where: { id, deletedAt: null } });
+  private async getPendingEvent(tx: Prisma.TransactionClient, id: number, actorId: number) {
+    const event = await tx.event.findFirst({
+      where: { id, deletedAt: null },
+      include: { business: { select: { ownerId: true } } },
+    });
     if (!event) {
       throw new NotFoundException(`Event ${id} not found`);
     }
+    // Conflict of interest (D-75): nobody approves their own business's events.
+    assertNotOwnBusiness({ ownerId: event.business?.ownerId ?? null }, { id: actorId });
     if (event.status !== EventStatus.PENDING) {
       throw new ConflictException(`Event ${id} is not pending review (current status: ${event.status})`);
     }
