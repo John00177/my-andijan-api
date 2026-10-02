@@ -47,6 +47,15 @@ describe('Authorization end-to-end (real AppModule)', () => {
           USERS[where.id] ? { ...USERS[where.id], status: UserStatus.ACTIVE, deletedAt: null, sessionVersion: 0 } : null,
         ),
       },
+      // Access tokens must name a live session (Phase 15E.4d.2). Each test
+      // user owns one live session whose id equals the user id.
+      authSession: {
+        findUnique: jest.fn(async ({ where }: { where: { id: number } }) =>
+          USERS[where.id]
+            ? { userId: where.id, revokedAt: null, revokedReason: null, absoluteExpiresAt: new Date(Date.now() + 86_400_000) }
+            : null,
+        ),
+      },
       $connect: jest.fn(),
       $disconnect: jest.fn(),
       onModuleInit: jest.fn(),
@@ -76,7 +85,7 @@ describe('Authorization end-to-end (real AppModule)', () => {
     const jwt = new JwtService({});
     for (const user of Object.values(USERS)) {
       tokens[user.role] = await jwt.signAsync(
-        { sub: user.id, phone: user.phone, role: user.role, sv: 0 },
+        { sub: user.id, phone: user.phone, role: user.role, sv: 0, sid: user.id },
         { secret: process.env.JWT_ACCESS_SECRET },
       );
     }

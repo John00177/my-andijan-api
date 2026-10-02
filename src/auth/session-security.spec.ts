@@ -270,12 +270,23 @@ describe('Session security (Phase 15B, sessions since 15E.4b)', () => {
     strategy = new JwtStrategy(prisma);
   });
 
-  it('a token issued before Phase 15B (no `sv` claim) stays valid while the account is untouched', async () => {
-    const legacy = await jwt.signAsync(
-      { sub: 2, phone: PHONE, role: UserRole.BUSINESS_OWNER },
+  it('a token without an `sv` claim counts as version 0 (with a live session)', async () => {
+    await auth.login({ phone: PHONE, password: 'old-password' });
+    const noSv = await jwt.signAsync(
+      { sub: 2, phone: PHONE, role: UserRole.BUSINESS_OWNER, sid: db.sessions[0].id },
       { secret: process.env.JWT_ACCESS_SECRET },
     );
-    await expect(authenticate(legacy)).resolves.toEqual(expect.objectContaining({ id: 2 }));
+    await expect(authenticate(noSv)).resolves.toEqual(expect.objectContaining({ id: 2 }));
+  });
+
+  it('a correctly signed token for an active user but with no `sid` is refused (Phase 15E.4d.2)', async () => {
+    const noSid = await jwt.signAsync(
+      { sub: 2, phone: PHONE, role: UserRole.BUSINESS_OWNER, sv: 0 },
+      { secret: process.env.JWT_ACCESS_SECRET },
+    );
+    const error = await authenticate(noSid).catch((e) => e);
+    expect(error).toBeInstanceOf(UnauthorizedException);
+    expect(error.getResponse()).toEqual({ message: 'Unauthorized', statusCode: 401 });
   });
 
   it('active session → suspension → the old access AND refresh tokens are refused', async () => {
@@ -386,7 +397,7 @@ describe('Session security (Phase 15B, sessions since 15E.4b)', () => {
           secret: process.env.JWT_ACCESS_SECRET,
         });
 
-      for (const sid of [999, otherSid, 0, -1, 1.5, '1']) {
+      for (const sid of [999, otherSid, 0, -1, 1.5, '1', null, undefined]) {
         const error = await authenticate(await forge(sid)).catch((e) => e);
         expect(error).toBeInstanceOf(UnauthorizedException);
         expect(error.getResponse()).toEqual({ message: 'Unauthorized', statusCode: 401 });

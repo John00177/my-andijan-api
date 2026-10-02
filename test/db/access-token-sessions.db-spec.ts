@@ -16,10 +16,10 @@ import { CurrentUser } from '../../src/common/decorators/current-user.decorator'
 import { PrismaService } from '../../src/prisma/prisma.service';
 import { createTestPrisma, createUser, PASSWORD, resetDatabase, services } from './support';
 
-// Phase 15E.4d.1 — access tokens bound to their AuthSession (`sid`), over
-// real HTTP through the real global AuthzGuard and passport JwtStrategy, on
-// real PostgreSQL. Tokens without `sid` (issued before 15E.4d.1) are still
-// accepted with the pre-existing checks during the compatibility window.
+// Phase 15E.4d — access tokens bound to their AuthSession (`sid`), over real
+// HTTP through the real global AuthzGuard and passport JwtStrategy, on real
+// PostgreSQL. Since 15E.4d.2 `sid` is mandatory: the 15E.4d.1 compatibility
+// path for tokens without it is gone.
 
 @Controller('probe')
 class ProbeController {
@@ -33,7 +33,7 @@ class ProbeController {
 const GENERIC_401 = { message: 'Unauthorized', statusCode: 401 };
 const sha256 = (raw: string) => createHash('sha256').update(raw).digest('hex');
 
-describe('Access-token session binding on PostgreSQL (Phase 15E.4d.1)', () => {
+describe('Access-token session binding on PostgreSQL (Phase 15E.4d.1 + 15E.4d.2)', () => {
   let prisma: PrismaClient;
   let auth: AuthService;
   let admin: AdminService;
@@ -135,11 +135,21 @@ describe('Access-token session binding on PostgreSQL (Phase 15E.4d.1)', () => {
       expect(res.body).toEqual({ id: user.id });
     });
 
-    it('5. a token without sid (issued before 15E.4d.1) still authenticates during the compatibility window', async () => {
-      const user = await createUser(prisma, nextPhone());
-      const legacy = await sign({ sub: user.id, phone: user.phone, role: user.role, sv: 0 });
-      expect(claims(legacy).sid).toBeUndefined();
-      expect((await probe(legacy)).status).toBe(200);
+    it('5. REGRESSION (15E.4d.2): a correctly signed token for an active user with a live session but NO sid → exactly the generic 401', async () => {
+      const { user } = await signIn(); // the user has a live session; the token just does not name it
+      const noSid = await sign({ sub: user.id, phone: user.phone, role: user.role, sv: 0 });
+      expect(claims(noSid).sid).toBeUndefined();
+
+      const res = await probe(noSid);
+
+      expect(res.status).toBe(401);
+      expect(res.body).toStrictEqual({ message: 'Unauthorized', statusCode: 401 });
+      await expectRefused(noSid);
+    });
+
+    it('5b. sid explicitly undefined (dropped from the JSON) → generic 401', async () => {
+      const { user } = await signIn();
+      await expectRefused(await sign({ sub: user.id, phone: user.phone, role: user.role, sv: 0, sid: undefined }));
     });
 
     it('6. a sid naming no session → 401', async () => {
@@ -155,9 +165,9 @@ describe('Access-token session binding on PostgreSQL (Phase 15E.4d.1)', () => {
       expect((await probe(victim.accessToken)).status).toBe(200); // the victim is unaffected
     });
 
-    it('malformed sid values → 401', async () => {
-      const user = await createUser(prisma, nextPhone());
-      for (const sid of [0, -3, 2.5, '1', null]) {
+    it('malformed sid values (null, 0, -1, 1.5, "1", unsafe integer) → generic 401', async () => {
+      const { user } = await signIn();
+      for (const sid of [null, 0, -1, 1.5, '1', Number.MAX_SAFE_INTEGER + 2]) {
         await expectRefused(await sign({ sub: user.id, phone: user.phone, role: user.role, sv: 0, sid }));
       }
     });
@@ -216,10 +226,9 @@ describe('Access-token session binding on PostgreSQL (Phase 15E.4d.1)', () => {
       await expectRefused(deleted.accessToken);
     });
 
-    it('11. sessionVersion still rules user-wide: password reset and suspension refuse every token, sid or not', async () => {
+    it('11. sessionVersion still rules user-wide: password reset and suspension refuse every token', async () => {
       const a = await signIn();
       const b = await auth.login({ phone: a.user.phone, password: PASSWORD });
-      const legacy = await sign({ sub: a.user.id, phone: a.user.phone, role: a.user.role, sv: 0 });
       await prisma.otpCode.create({
         data: {
           phone: a.user.phone,
@@ -231,7 +240,7 @@ describe('Access-token session binding on PostgreSQL (Phase 15E.4d.1)', () => {
 
       await auth.resetPassword({ phone: a.user.phone, code: '135790', newPassword: 'brand-new-password' });
 
-      for (const token of [a.accessToken, b.accessToken, legacy]) await expectRefused(token);
+      for (const token of [a.accessToken, b.accessToken]) await expectRefused(token);
 
       const staffUser = await createUser(prisma, nextPhone(), UserRole.SUPER_ADMIN);
       const c = await signIn();
