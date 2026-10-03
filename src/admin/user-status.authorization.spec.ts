@@ -114,8 +114,8 @@ describe('AdminService.suspendUser / activateUser (Phase 15B)', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         findUniqueOrThrow: jest.fn(),
       },
-      // Session-less legacy tokens first (none here), then every token.
-      refreshToken: { updateMany: jest.fn().mockResolvedValueOnce({ count: 0 }).mockResolvedValue({ count: 3 }) },
+      // Every token of the target, in one statement (no session-less sweep since 15E.4e.1).
+      refreshToken: { updateMany: jest.fn().mockResolvedValue({ count: 3 }) },
       authSession: { updateMany: jest.fn().mockResolvedValue({ count: 2 }) },
       auditLog: { create: jest.fn() },
     };
@@ -143,10 +143,7 @@ describe('AdminService.suspendUser / activateUser (Phase 15B)', () => {
       where: { userId: 2, revokedAt: null },
       data: { revokedAt: expect.any(Date), revokedReason: SessionRevokedReason.SUSPENDED },
     });
-    expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
-      where: { userId: 2, sessionId: null, revokedAt: null },
-      data: { revokedAt: expect.any(Date) },
-    });
+    expect(prisma.refreshToken.updateMany).toHaveBeenCalledTimes(1);
     expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
       where: { userId: 2, revokedAt: null },
       data: { revokedAt: expect.any(Date) },

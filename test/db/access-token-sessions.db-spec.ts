@@ -254,6 +254,17 @@ describe('Access-token session binding on PostgreSQL (Phase 15E.4d.1 + 15E.4d.2)
       await expectRefused(accessToken);
     });
 
+    it('11c. sv is mandatory (15E.4e.1): a live sid but sv missing or not the stored integer → generic 401', async () => {
+      const { user, refreshToken } = await signIn();
+      const sid = await sessionIdOf(refreshToken);
+      const claims = { sub: user.id, phone: user.phone, role: user.role, sid };
+      // The same claims with the current sv are accepted — only sv differs below.
+      expect((await probe(await sign({ ...claims, sv: 0 }))).status).toBe(200);
+      for (const sv of [undefined, null, '0', 0.5, -1]) {
+        await expectRefused(await sign({ ...claims, ...(sv === undefined ? {} : { sv }) }));
+      }
+    });
+
     it('12. an expired JWT → 401, even with a live session', async () => {
       const { user, refreshToken } = await signIn();
       const sid = await sessionIdOf(refreshToken);

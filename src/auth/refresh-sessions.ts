@@ -9,9 +9,10 @@ import { getRequestContext } from '../common/request-context/request-context';
 // CONCURRENCY — PostgreSQL is the only source of truth; nothing here relies on
 // in-process state, so it holds with any number of replicas.
 //
-//   Lock order, everywhere: user row → legacy (session-less) tokens → session
-//   rows → token rows. Every refresh and every revocation takes the session
-//   row's lock before it touches that session's tokens.
+//   Lock order, everywhere: user row → session rows → token rows. Every
+//   refresh and every revocation takes the session row's lock before it
+//   touches that session's tokens. (refresh_tokens.session_id is NOT NULL
+//   since Phase 15E.4e.1, so there is no session-less token to lock first.)
 //
 //   The locks are taken by CONDITIONAL UPDATEs, not by a SELECT followed by a
 //   decision. Prisma 5.22 emits `updateMany` with scalar filters as one
@@ -54,16 +55,6 @@ const MAX_IP = 45;
  */
 export function refreshTokenExpiry(now: Date, ttlMs: number, absoluteExpiresAt: Date): Date {
   return new Date(Math.min(now.getTime() + ttlMs, absoluteExpiresAt.getTime()));
-}
-
-/**
- * The absolute expiry given to a session created for a token issued by the
- * pre-15E.4b code — the same rule as the backfill in migration
- * 20261002090000_phase15e4b_auth_sessions: the token's creation + 90 days,
- * but never earlier than the token's own expiry (nobody is signed out early).
- */
-export function legacySessionExpiry(tokenCreatedAt: Date, tokenExpiresAt: Date): Date {
-  return new Date(Math.max(tokenCreatedAt.getTime() + ABSOLUTE_SESSION_TTL_MS, tokenExpiresAt.getTime()));
 }
 
 /** User agent and client address of the current request, bounded to the column widths. */
@@ -152,16 +143,12 @@ export async function revokeSessionForReuse(
  * the transaction that has ALREADY written the user row (status and/or
  * sessionVersion), so the user row is the first lock taken.
  *
- *   1. Session-less legacy tokens first. A refresh that is attaching one of
- *      them to a new session holds its row lock; waiting here means the
- *      session it creates is committed — and therefore visible — before
- *      step 2 runs. One that starts after this step finds its token revoked.
- *   2. Every unrevoked session. Each UPDATE waits for any refresh holding that
+ *   1. Every unrevoked session. Each UPDATE waits for any refresh holding that
  *      session's row, so a rotation in flight either commits first (and its
- *      successor is caught by step 3) or runs after us (and finds the session
+ *      successor is caught by step 2) or runs after us (and finds the session
  *      revoked).
- *   3. Every unrevoked token, in a fresh statement snapshot that includes any
- *      successor committed while step 2 waited.
+ *   2. Every unrevoked token of the user, in a fresh statement snapshot that
+ *      includes any successor committed while step 1 waited.
  *
  * Revoked sessions stay revoked: nothing — reinstatement included — revives one.
  */
@@ -171,10 +158,6 @@ export async function revokeAllUserSessions(
   reason: SessionRevokedReason,
   now: Date,
 ): Promise<{ sessionsRevoked: number; tokensRevoked: number }> {
-  const legacy = await tx.refreshToken.updateMany({
-    where: { userId, sessionId: null, revokedAt: null },
-    data: { revokedAt: now },
-  });
   const sessions = await tx.authSession.updateMany({
     where: { userId, revokedAt: null },
     data: { revokedAt: now, revokedReason: reason },
@@ -183,5 +166,5 @@ export async function revokeAllUserSessions(
     where: { userId, revokedAt: null },
     data: { revokedAt: now },
   });
-  return { sessionsRevoked: sessions.count, tokensRevoked: legacy.count + tokens.count };
+  return { sessionsRevoked: sessions.count, tokensRevoked: tokens.count };
 }

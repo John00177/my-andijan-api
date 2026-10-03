@@ -438,7 +438,7 @@ describe('Refresh-token reuse detection on PostgreSQL (Phase 15E.4c)', () => {
     });
   });
 
-  describe('dead sessions and legacy tokens', () => {
+  describe('dead sessions and revoked-but-unrotated tokens', () => {
     it('15. a rotated token of an already revoked session → plain 401, no audit, the reason is unchanged', async () => {
       const { refreshToken: r1 } = await signIn();
       const { refreshToken: r2 } = await refresh(r1);
@@ -465,29 +465,20 @@ describe('Refresh-token reuse detection on PostgreSQL (Phase 15E.4c)', () => {
       expect(await reuseAudits()).toHaveLength(0);
     });
 
-    it('18. legacy tokens: one rotated by the previous release is a plain 401; one attached and rotated by this code is reuse when replayed', async () => {
-      const user = await createUser(prisma, nextPhone());
-      // Rotated by the previous release: revoked, never rotated_at, no session.
-      await prisma.refreshToken.create({
-        data: { userId: user.id, tokenHash: sha256('legacy-old-release'), expiresAt: new Date(Date.now() + DAY), revokedAt: new Date() },
-      });
-      await refreshError('legacy-old-release');
-      expect(await prisma.authSession.count()).toBe(0);
+    it('18. a token revoked without ever being rotated, in a live session → plain 401, not reuse: session untouched, no audit', async () => {
+      // The "not-rotated" branch of the classification (15E.4c), now that no
+      // session-less row can carry it (15E.4e.1): revoked_at set, rotated_at NULL.
+      const { refreshToken: r1 } = await signIn();
+      const row = await tokenRow(r1);
+      await prisma.refreshToken.update({ where: { id: row.id }, data: { revokedAt: new Date(Date.now() - 60 * 60_000) } });
+
+      const error = await refreshError(r1);
+
+      expect(error.getResponse()).toEqual(GENERIC_401);
+      const session = await prisma.authSession.findUniqueOrThrow({ where: { id: row.sessionId } });
+      expect(session.revokedAt).toBeNull();
       expect(await reuseAudits()).toHaveLength(0);
-
-      // A live legacy token: attached and rotated normally, then replayed later.
-      const legacyRaw = 'f'.repeat(96);
-      await prisma.refreshToken.create({
-        data: { userId: user.id, tokenHash: sha256(legacyRaw), expiresAt: new Date(Date.now() + 30 * DAY) },
-      });
-      const { refreshToken: next } = await refresh(legacyRaw);
-      await age(legacyRaw);
-
-      await refreshError(legacyRaw);
-
-      expect((await sessionOf(legacyRaw)).revokedReason).toBe(SessionRevokedReason.REUSE_DETECTED);
-      await expect(refresh(next)).rejects.toThrow(UnauthorizedException);
-      expect(await prisma.authSession.count()).toBe(1);
+      expect(await prisma.refreshToken.count({ where: { parentId: row.id } })).toBe(0); // no successor
     });
   });
 

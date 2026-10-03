@@ -1,6 +1,10 @@
 import { JwtService } from '@nestjs/jwt';
 import { Prisma, PrismaClient, UserRole } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
+import { execFileSync } from 'child_process';
+import { cpSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { AuthService } from '../../src/auth/auth.service';
 import { AdminService } from '../../src/admin/admin.service';
 import { PrismaService } from '../../src/prisma/prisma.service';
@@ -34,6 +38,83 @@ export function testDatabaseUrl(): string {
   // Room for one lock holder, ten contenders and an observer at once.
   if (!url.searchParams.has('connection_limit')) url.searchParams.set('connection_limit', '25');
   return url.toString();
+}
+
+// ---------------------------------------------------------------------------
+// Migration suites: each runs on its OWN throwaway database next to the test
+// database (same local server, name "<test db>_<suffix>"), built from a chosen
+// prefix of prisma/migrations — so a migration is applied the way production
+// gets it: on top of data the previous release wrote.
+// ---------------------------------------------------------------------------
+
+export const REPO_ROOT = join(__dirname, '..', '..');
+const MIGRATIONS_DIR = join(REPO_ROOT, 'prisma', 'migrations');
+
+/** URL of the scratch database "<test db>_<suffix>" (the same safety checks apply). */
+export function scratchDatabaseUrl(suffix: string): { url: string; name: string } {
+  const base = new URL(testDatabaseUrl());
+  const name = `${base.pathname.replace(/^\//, '')}_${suffix}`;
+  base.pathname = `/${name}`;
+  base.searchParams.delete('connection_limit');
+  return { url: base.toString(), name };
+}
+
+/** Drops (if present) and creates a scratch database, via a connection to the test database. */
+export async function recreateDatabase(admin: PrismaClient, name: string): Promise<void> {
+  await admin.$executeRawUnsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+  await admin.$executeRawUnsafe(
+    `CREATE DATABASE "${name}" ENCODING 'UTF8' TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'`,
+  );
+}
+
+/** Every committed migration directory name, in apply order. */
+export function listMigrations(): string[] {
+  return readdirSync(MIGRATIONS_DIR)
+    .filter((entry) => /^\d{14}_/.test(entry))
+    .sort();
+}
+
+/**
+ * A temporary Prisma project holding only the migrations `include` selects
+ * (plus migration_lock.toml), optionally with extra SQL appended to one of
+ * them — used to prove a migration file is applied atomically.
+ */
+export function migrationsWorkDir(
+  include: (migration: string) => boolean,
+  append?: { migration: string; sql: string },
+): string {
+  const dir = mkdtempSync(join(tmpdir(), 'andijan-migrations-'));
+  cpSync(join(REPO_ROOT, 'prisma', 'schema.prisma'), join(dir, 'schema.prisma'));
+  cpSync(join(MIGRATIONS_DIR, 'migration_lock.toml'), join(dir, 'migrations', 'migration_lock.toml'));
+  for (const migration of listMigrations().filter(include)) {
+    cpSync(join(MIGRATIONS_DIR, migration), join(dir, 'migrations', migration), { recursive: true });
+    if (append?.migration === migration) {
+      const file = join(dir, 'migrations', migration, 'migration.sql');
+      writeFileSync(file, `${readFileSync(file, 'utf8')}\n${append.sql}\n`);
+    }
+  }
+  return dir;
+}
+
+/**
+ * `prisma migrate deploy` of a work dir against a scratch database. DATABASE_URL
+ * is set explicitly for the child, so no .env file can redirect it. Returns the
+ * outcome instead of throwing; output is kept for assertions, never printed.
+ */
+export function deployMigrations(workDir: string, databaseUrl: string): { ok: boolean; output: string } {
+  try {
+    const output = execFileSync('npx', ['prisma', 'migrate', 'deploy', '--schema', join(workDir, 'schema.prisma')], {
+      cwd: REPO_ROOT,
+      env: { ...process.env, DATABASE_URL: databaseUrl },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: process.platform === 'win32', // npx is a .cmd shim on Windows
+      timeout: 120_000,
+    });
+    return { ok: true, output: String(output) };
+  } catch (error) {
+    const e = error as { stdout?: Buffer; stderr?: Buffer };
+    return { ok: false, output: `${e.stdout ?? ''}${e.stderr ?? ''}` };
+  }
 }
 
 export function createTestPrisma(log = false): PrismaClient {

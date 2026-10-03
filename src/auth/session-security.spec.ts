@@ -30,7 +30,7 @@ type UserRow = {
 type TokenRow = {
   id: number;
   userId: number;
-  sessionId: number | null;
+  sessionId: number;
   parentId: number | null;
   tokenHash: string;
   expiresAt: Date;
@@ -146,13 +146,13 @@ function createDb() {
     },
     refreshToken: {
       create: async ({ data }: { data: Partial<TokenRow> }) => {
-        // parent_id UNIQUE, as in the real schema.
+        // parent_id UNIQUE and session_id NOT NULL, as in the real schema.
         if (data.parentId != null && tokens.some((t) => t.parentId === data.parentId)) {
           throw new Error('unique violation: parent_id');
         }
+        if (data.sessionId == null) throw new Error('not-null violation: session_id');
         const row = {
           id: tokens.length + 1,
-          sessionId: null,
           parentId: null,
           rotatedAt: null,
           revokedAt: null,
@@ -270,13 +270,25 @@ describe('Session security (Phase 15B, sessions since 15E.4b)', () => {
     strategy = new JwtStrategy(prisma);
   });
 
-  it('a token without an `sv` claim counts as version 0 (with a live session)', async () => {
+  it('a correctly signed token with a live `sid` but NO `sv` is refused — `sv` is mandatory (Phase 15E.4e.1)', async () => {
     await auth.login({ phone: PHONE, password: 'old-password' });
-    const noSv = await jwt.signAsync(
-      { sub: 2, phone: PHONE, role: UserRole.BUSINESS_OWNER, sid: db.sessions[0].id },
+    const sid = db.sessions[0].id;
+    // The same claims with the current sv authenticate — only the missing claim differs.
+    const withSv = await jwt.signAsync(
+      { sub: 2, phone: PHONE, role: UserRole.BUSINESS_OWNER, sv: 0, sid },
       { secret: process.env.JWT_ACCESS_SECRET },
     );
-    await expect(authenticate(noSv)).resolves.toEqual(expect.objectContaining({ id: 2 }));
+    await expect(authenticate(withSv)).resolves.toEqual(expect.objectContaining({ id: 2 }));
+
+    for (const sv of [undefined, null, '0', 0.5]) {
+      const token = await jwt.signAsync(
+        { sub: 2, phone: PHONE, role: UserRole.BUSINESS_OWNER, sid, ...(sv === undefined ? {} : { sv }) },
+        { secret: process.env.JWT_ACCESS_SECRET },
+      );
+      const error = await authenticate(token).catch((e) => e);
+      expect(error).toBeInstanceOf(UnauthorizedException);
+      expect(error.getResponse()).toEqual({ message: 'Unauthorized', statusCode: 401 });
+    }
   });
 
   it('a correctly signed token for an active user but with no `sid` is refused (Phase 15E.4d.2)', async () => {

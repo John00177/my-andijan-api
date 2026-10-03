@@ -168,15 +168,19 @@ enum NotificationType {
   SYSTEM
 }
 
-// Why an AuthSession ended (Phase 15E.4b). REUSE_DETECTED is written from
-// Phase 15E.4c on and LEGACY_MIGRATION by the 15E.4e contract step; both are
-// declared now so those phases need no enum migration.
+// Why an AuthSession ended (Phase 15E.4b; REUSE_DETECTED from 15E.4c).
+//
+// The database type still carries a fifth value, LEGACY_MIGRATION, which no
+// code has ever written (no row holds it). It is left out of this schema on
+// purpose (Phase 15E.4e.1): the client must stop knowing it one release
+// before 15E.4e.2 removes it from the database, so that removal is safe while
+// this release is still serving. `prisma migrate dev` will offer to generate
+// that removal — it belongs to 15E.4e.2, not to an unrelated change.
 enum SessionRevokedReason {
   LOGOUT
   PASSWORD_RESET
   SUSPENDED
   REUSE_DETECTED
-  LEGACY_MIGRATION
 }
 
 enum AuditAction {
@@ -302,14 +306,18 @@ model RefreshToken {
   tokenHash String    @unique @map("token_hash")
   expiresAt DateTime  @map("expires_at")
   revokedAt DateTime? @map("revoked_at")
-  // Unused; superseded by the session-level fields. Dropped in 15E.4e.
-  userAgent String?   @map("user_agent") @db.VarChar(500)
-  ipAddress String?   @map("ip_address") @db.VarChar(45)
   createdAt DateTime  @default(now()) @map("created_at")
+  // The database table still has two never-written columns, user_agent and
+  // ip_address (superseded by the session-level fields). They are left out of
+  // this schema on purpose (Phase 15E.4e.1): Prisma names every column it
+  // reads or returns, so the client must stop knowing them one release before
+  // 15E.4e.2 drops them — otherwise the drop would break this release's
+  // refreshes while it is still serving. `prisma migrate dev` will offer to
+  // generate that drop; it belongs to 15E.4e.2.
 
-  // Phase 15E.4b. sessionId is nullable only while tokens issued by the
-  // pre-15E.4b code can still exist; 15E.4e makes it NOT NULL.
-  sessionId Int?      @map("session_id")
+  // Every refresh token belongs to exactly one AuthSession — NOT NULL since
+  // Phase 15E.4e.1 (contract step of 15E.4b's expand/backfill).
+  sessionId Int       @map("session_id")
   // Set (together with revokedAt) by the one refresh that rotated this token.
   rotatedAt DateTime? @map("rotated_at")
   // The token this one replaced. UNIQUE: the database itself refuses a
@@ -317,7 +325,7 @@ model RefreshToken {
   parentId  Int?      @unique @map("parent_id")
 
   user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  session   AuthSession?  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  session   AuthSession   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   parent    RefreshToken? @relation("RefreshTokenRotation", fields: [parentId], references: [id], onDelete: SetNull)
   successor RefreshToken? @relation("RefreshTokenRotation")
 
