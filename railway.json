@@ -5,7 +5,10 @@
     "buildCommand": "npm run build"
   },
   "deploy": {
-    "startCommand": "npx prisma migrate deploy && npm run start:prod",
+    "preDeployCommand": "npx prisma migrate deploy",
+    "startCommand": "npm run start:prod",
+    "healthcheckPath": "/categories",
+    "healthcheckTimeout": 120,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 3
   }
