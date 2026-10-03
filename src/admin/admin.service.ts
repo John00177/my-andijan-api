@@ -668,9 +668,25 @@ export class AdminService {
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
+        // Phase 16E.1 review context: what a reviewer needs to judge a claim
+        // before acting on it — whether the listing is still live and
+        // unowned, how many claims are competing for it (a hijacking signal),
+        // and whether the claimant's account is still active. Read-only
+        // state, no new PII: `claim.review` holders already see contact
+        // details here.
         include: {
-          business: { select: { id: true, slug: true, name: true, ownerId: true } },
-          claimant: { select: { id: true, fullName: true, phone: true, email: true, role: true } },
+          business: {
+            select: {
+              id: true,
+              slug: true,
+              name: true,
+              ownerId: true,
+              status: true,
+              deletedAt: true,
+              _count: { select: { claims: { where: { status: ClaimStatus.PENDING } } } },
+            },
+          },
+          claimant: { select: { id: true, fullName: true, phone: true, email: true, role: true, status: true } },
           reviewedBy: { select: { id: true, fullName: true } },
         },
       }),

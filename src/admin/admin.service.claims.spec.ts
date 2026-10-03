@@ -75,6 +75,38 @@ describe('AdminService — claims', () => {
       const call = prisma.businessClaim.findMany.mock.calls[0][0];
       expect(call.where).toEqual({ status: ClaimStatus.APPROVED });
     });
+
+    // Phase 16E.1: the queue carries the state a reviewer needs before acting
+    // — listing status/deletion, competing pending claims, claimant status.
+    it('includes the review context: business status, deletion, pending-claim count and claimant status', async () => {
+      prisma.businessClaim.findMany.mockResolvedValue([]);
+      prisma.businessClaim.count.mockResolvedValue(0);
+
+      await service.findClaims({ page: 1, limit: 20 } as any);
+
+      const { include } = prisma.businessClaim.findMany.mock.calls[0][0];
+      expect(include.business.select).toEqual(
+        expect.objectContaining({
+          status: true,
+          deletedAt: true,
+          ownerId: true,
+          _count: { select: { claims: { where: { status: ClaimStatus.PENDING } } } },
+        }),
+      );
+      expect(include.claimant.select).toEqual(expect.objectContaining({ status: true }));
+    });
+
+    it('selects claimant fields explicitly — never credentials or session state', async () => {
+      prisma.businessClaim.findMany.mockResolvedValue([]);
+      prisma.businessClaim.count.mockResolvedValue(0);
+
+      await service.findClaims({ page: 1, limit: 20 } as any);
+
+      const { include } = prisma.businessClaim.findMany.mock.calls[0][0];
+      expect(Object.keys(include.claimant.select).sort()).toEqual(
+        ['email', 'fullName', 'id', 'phone', 'role', 'status'].sort(),
+      );
+    });
   });
 
   describe('approveClaim', () => {
