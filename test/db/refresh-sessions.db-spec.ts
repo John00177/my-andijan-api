@@ -477,103 +477,43 @@ describe('Refresh-token sessions on PostgreSQL (Phase 15E.4b)', () => {
     expect(everything.includes(sha256(raws[0]))).toBe(true); // only the hash is ever stored or sent
   });
 
-  describe('TEST 13 — rolling-deploy compatibility', () => {
-    // The pre-15E.4b refresh, in behaviour: what the previous release does if
-    // it serves a request during the switchover, or after a rollback.
-    async function previousReleaseRefresh(raw: string): Promise<'rotated' | 'refused'> {
-      const stored = await prisma.refreshToken.findUnique({ where: { tokenHash: sha256(raw) }, include: { user: true } });
-      if (!stored || stored.revokedAt || stored.expiresAt < new Date()) return 'refused';
-      if (!stored.user || stored.user.deletedAt || stored.user.status !== UserStatus.ACTIVE) return 'refused';
-      await prisma.refreshToken.update({ where: { id: stored.id }, data: { revokedAt: new Date() } });
-      await prisma.refreshToken.create({
-        data: { userId: stored.userId, tokenHash: sha256(`${raw}-next`), expiresAt: new Date(Date.now() + 30 * DAY) },
-      });
-      return 'rotated';
-    }
-
-    async function insertLegacyToken(userId: number, raw: string, createdAt = new Date()) {
-      // Exactly the columns the previous release writes — no session.
-      return prisma.refreshToken.create({
-        data: { userId, tokenHash: sha256(raw), expiresAt: new Date(createdAt.getTime() + 30 * DAY), createdAt },
-      });
-    }
-
-    it('a token rotated by the new code is refused by the previous release too (no resurrection on rollback)', async () => {
+  describe('TEST 13 — the session contract (Phase 15E.4e.1) and rolling-deploy compatibility', () => {
+    it('rotation stamps revoked_at with rotated_at, so a rotated token fails every plain "revoked_at IS NULL" check', async () => {
       const { refreshToken } = await signIn();
       await refresh(refreshToken);
-      expect(await previousReleaseRefresh(refreshToken)).toBe('refused');
+      const row = await tokenRow(refreshToken);
+      expect(row.rotatedAt).toEqual(expect.any(Date));
+      expect(row.revokedAt).toEqual(row.rotatedAt);
+      expect(await prisma.refreshToken.count({ where: { id: row.id, revokedAt: null } })).toBe(0);
     });
 
-    it('a session-less token written by the previous release is attached to a new session on first use', async () => {
+    it('the database refuses a refresh token without a session (session_id NOT NULL)', async () => {
       const user = await createUser(prisma, nextPhone());
-      const createdAt = new Date(Date.now() - 10 * DAY);
-      const legacyRaw = 'a'.repeat(96);
-      const legacy = await insertLegacyToken(user.id, legacyRaw, createdAt);
+      const [{ is_nullable }] = await prisma.$queryRaw<Array<{ is_nullable: string }>>`
+        SELECT is_nullable FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'refresh_tokens' AND column_name = 'session_id'`;
+      expect(is_nullable).toBe('NO');
 
-      const next = await refresh(legacyRaw);
-
-      const attached = await prisma.refreshToken.findUniqueOrThrow({ where: { id: legacy.id } });
-      expect(attached.sessionId).toEqual(expect.any(Number));
-      expect(attached.rotatedAt).toEqual(expect.any(Date));
-      const session = await prisma.authSession.findUniqueOrThrow({ where: { id: attached.sessionId! } });
-      expect(session.createdAt).toEqual(createdAt);
-      expect(session.absoluteExpiresAt.getTime()).toBe(createdAt.getTime() + 90 * DAY);
-      expect(await tokenRow(next.refreshToken)).toEqual(
-        expect.objectContaining({ sessionId: session.id, parentId: legacy.id }),
-      );
+      // Exactly the INSERT the pre-15E.4b release issued — no session_id.
+      const error = await prisma
+        .$executeRaw`INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (${user.id}, ${sha256('no-session')}, now() + interval '1 day')`
+        .catch((e) => e);
+      expect(String(error?.message ?? error)).toMatch(/23502|null value in column "session_id"/);
+      expect(await prisma.refreshToken.count({ where: { userId: user.id } })).toBe(0);
     });
 
-    it('concurrent first uses of one legacy token: one session, one successor, no orphan session', async () => {
-      for (let round = 0; round < 10; round++) {
-        await resetDatabase(prisma);
-        const user = await createUser(prisma, nextPhone());
-        const legacyRaw = String(round).repeat(96).slice(0, 96);
-        const legacy = await insertLegacyToken(user.id, legacyRaw);
-
-        const results = await Promise.allSettled(Array.from({ length: 5 }, () => refresh(legacyRaw)));
-
-        expect(results.filter((r) => r.status === 'fulfilled').length).toBe(1);
-        expect(await prisma.authSession.count()).toBe(1);
-        expect(await prisma.refreshToken.count({ where: { parentId: legacy.id } })).toBe(1);
-      }
-    });
-
-    it('a password reset racing the first use of a legacy token leaves no live token behind', async () => {
-      for (let round = 0; round < 10; round++) {
-        const user = await createUser(prisma, nextPhone());
-        const legacyRaw = `${round}`.padStart(96, 'b');
-        await insertLegacyToken(user.id, legacyRaw);
-        await prisma.otpCode.create({
-          data: {
-            phone: user.phone,
-            purpose: OtpPurpose.PASSWORD_RESET,
-            codeHash: await bcrypt.hash('135790', 4),
-            expiresAt: new Date(Date.now() + 10 * 60_000),
-          },
-        });
-
-        await Promise.allSettled([
-          refresh(legacyRaw),
-          auth.resetPassword({ phone: user.phone, code: '135790', newPassword: 'brand-new-password' }),
-        ]);
-
-        expect(await prisma.refreshToken.count({ where: { userId: user.id, revokedAt: null } })).toBe(0);
-        expect(await prisma.authSession.count({ where: { userId: user.id, revokedAt: null } })).toBe(0);
-      }
-    });
-
-    it('the previous release can still refresh and sign out against the expanded schema', async () => {
-      const { refreshToken } = await signIn();
-      expect(await previousReleaseRefresh(refreshToken)).toBe('rotated');
-      // ...and the session-less token it minted is accepted by the new code.
-      await expect(refresh(`${refreshToken}-next`)).resolves.toBeDefined();
-
-      // The previous release's logout statement still runs unchanged.
-      const legacyLogout = await prisma.refreshToken.updateMany({
-        where: { tokenHash: sha256('never-issued'), revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
-      expect(legacyLogout.count).toBe(0);
+    it("the previous release's (06d6de9) session-less statements still run, matching nothing, on the contracted schema", async () => {
+      // While 15E.4e.1 deploys, 06d6de9 keeps serving. Its legacy sweep in
+      // revokeAllUserSessions and its lazy-attach probe filter on
+      // session_id IS NULL — valid on a NOT NULL column, and now always empty.
+      const { user, refreshToken } = await signIn();
+      const swept = await prisma.$executeRaw`
+        UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = ${user.id} AND session_id IS NULL AND revoked_at IS NULL`;
+      expect(swept).toBe(0);
+      const [{ sessionless }] = await prisma.$queryRaw<Array<{ sessionless: number }>>`
+        SELECT count(*)::int AS sessionless FROM refresh_tokens WHERE session_id IS NULL`;
+      expect(sessionless).toBe(0);
+      await expect(refresh(refreshToken)).resolves.toBeDefined(); // the token is untouched
     });
   });
 
@@ -728,71 +668,5 @@ describe('Refresh-token sessions on PostgreSQL (Phase 15E.4b)', () => {
       expect(await prisma.auditLog.count({ where: { entityType: 'AuthSession' } })).toBe(0);
     });
 
-    describe('legacy (session-less) token', () => {
-      async function insertLegacy(userId: number, raw: string) {
-        return prisma.refreshToken.create({
-          data: { userId, tokenHash: sha256(raw), expiresAt: new Date(Date.now() + 30 * DAY_MS) },
-        });
-      }
-
-      it('logout loses its first UPDATE to the concurrent first refresh (forced) and ends the session that refresh attached', async () => {
-        const user = await createUser(prisma, nextPhone());
-        const legacyRaw = 'c'.repeat(96);
-        const legacy = await insertLegacy(user.id, legacyRaw);
-        let outcome!: Promise<PromiseSettledResult<unknown>[]>;
-
-        await inRolledBackTransaction(prisma, async (tx) => {
-          // Stops the refresh at its successor INSERT — after it attached the
-          // session to the token and rotated it, still holding the token's row.
-          await tx.refreshToken.create({
-            data: {
-              userId: user.id,
-              parentId: legacy.id,
-              tokenHash: sha256('placeholder-legacy'),
-              expiresAt: new Date(Date.now() + DAY_MS),
-            },
-          });
-          const refreshing = refresh(legacyRaw);
-          await waitForLockWaiters(prisma, 'refresh_tokens', 1);
-          const loggingOut = auth.logout(legacyRaw); // reads it as live and session-less; its UPDATE waits on the row
-          await waitForLockWaiters(prisma, 'refresh_tokens', 2);
-          outcome = Promise.allSettled([refreshing, loggingOut]);
-        });
-        const [refreshed, loggedOut] = await outcome;
-
-        expect(refreshed.status).toBe('fulfilled');
-        expect(loggedOut).toEqual({ status: 'fulfilled', value: { success: true } });
-        const sessions = await prisma.authSession.findMany({ where: { userId: user.id } });
-        expect(sessions).toHaveLength(1); // no duplicate session
-        expect(sessions[0].revokedReason).toBe(SessionRevokedReason.LOGOUT);
-        expect(await liveTokens({ userId: user.id })).toBe(0);
-      });
-
-      it('unsynchronised first refresh + logout, 10 rounds: no live session or token, never two sessions', async () => {
-        for (let round = 0; round < 10; round++) {
-          const user = await createUser(prisma, nextPhone());
-          const legacyRaw = `${round}`.padStart(96, 'd');
-          await insertLegacy(user.id, legacyRaw);
-
-          await Promise.allSettled([refresh(legacyRaw), auth.logout(legacyRaw)]);
-
-          expect(await liveTokens({ userId: user.id })).toBe(0);
-          expect(await prisma.authSession.count({ where: { userId: user.id, revokedAt: null } })).toBe(0);
-          expect(await prisma.authSession.count({ where: { userId: user.id } })).toBeLessThanOrEqual(1);
-        }
-      });
-
-      it('logout of an untouched legacy token revokes just that token (it is the whole session)', async () => {
-        const user = await createUser(prisma, nextPhone());
-        const legacyRaw = 'e'.repeat(96);
-        await insertLegacy(user.id, legacyRaw);
-
-        await expect(auth.logout(legacyRaw)).resolves.toEqual({ success: true });
-
-        expect(await liveTokens({ userId: user.id })).toBe(0);
-        expect(await prisma.authSession.count()).toBe(0);
-        await expect(refresh(legacyRaw)).rejects.toThrow(UnauthorizedException);
-      });
-    });
   });
 });

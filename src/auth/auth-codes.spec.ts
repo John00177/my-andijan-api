@@ -79,7 +79,7 @@ function otpMatches(o: Otp, w: Where): boolean {
 function createDb() {
   const users: User[] = [];
   const otps: Otp[] = [];
-  const tokens: Array<{ id: number; userId: number; sessionId: number | null; revokedAt: Date | null }> = [];
+  const tokens: Array<{ id: number; userId: number; sessionId: number; revokedAt: Date | null }> = [];
   const sessions: Session[] = [];
   const audit: Array<Record<string, any>> = [];
   const findUser = (w: Where) => users.find((u) => (w.id !== undefined ? u.id === w.id : u.phone === w.phone));

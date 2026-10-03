@@ -9,9 +9,11 @@ export interface JwtPayload {
   sub: number;
   phone: string;
   role: UserRole;
-  // users.sessionVersion at issue time. Optional only because tokens minted
-  // before Phase 15B lack it; those count as version 0.
-  sv?: number;
+  // users.sessionVersion at issue time. Mandatory since Phase 15E.4e.1: every
+  // token AuthService has signed since Phase 15B carries it, and every token
+  // that can pass the mandatory `sid` check (15E.4d.2) was signed after that.
+  // Still checked at runtime — a decoded payload is untrusted input.
+  sv: number;
   // The AuthSession this token was issued for (Phase 15E.4d.1), mandatory
   // since Phase 15E.4d.2: every token AuthService issues carries it, and a
   // token without a valid one is refused. Required here because that is the
@@ -58,7 +60,9 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 
     // A password reset or suspension bumps sessionVersion, which kills every
     // access token issued before it on the very next request (user-wide).
-    if ((payload.sv ?? 0) !== user.sessionVersion) {
+    // Strict equality with the stored integer also refuses a token whose `sv`
+    // is missing or not a number (no more "absent counts as 0" — 15E.4e.1).
+    if (payload.sv !== user.sessionVersion) {
       throw new UnauthorizedException();
     }
 

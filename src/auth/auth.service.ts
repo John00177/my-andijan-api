@@ -33,7 +33,6 @@ import {
   ABSOLUTE_SESSION_TTL_MS,
   classifyRotatedPresentation,
   isWithinRefreshGraceWindow,
-  legacySessionExpiry,
   refreshTokenExpiry,
   revokeAllUserSessions,
   revokeSessionForReuse,
@@ -257,7 +256,8 @@ export class AuthService {
       select: { id: true, sessionId: true },
     });
     if (!presented) throw new RefreshRejected();
-    const sessionId = presented.sessionId ?? (await this.attachLegacySession(tx, presented.id, now));
+    // Every token has a session (session_id NOT NULL since Phase 15E.4e.1).
+    const sessionId = presented.sessionId;
 
     // 2. Serialization point: lock the session row. A concurrent refresh,
     //    logout or revocation of this session waits here until we commit, and
@@ -275,9 +275,10 @@ export class AuthService {
 
     // 3. Compare-and-set on the presented token, under the session lock. Only
     //    the request that flips rotatedAt from NULL may create a successor;
-    //    for every other one the count is 0. revokedAt is set as well, so a
-    //    rotated token stays dead even to code that predates rotatedAt (the
-    //    previous release during a rolling deploy, or after a rollback).
+    //    for every other one the count is 0. revokedAt is set as well:
+    //    `revokedAt IS NULL` is the one "still usable" test every other path
+    //    (logout, every revocation, this CAS) relies on, so a rotated token is
+    //    dead to all of them without each having to know about rotatedAt.
     const cas = await tx.refreshToken.updateMany({
       where: { id: presented.id, sessionId, rotatedAt: null, revokedAt: null, expiresAt: { gt: now } },
       data: { rotatedAt: now, revokedAt: now },
@@ -361,37 +362,6 @@ export class AuthService {
   }
 
   /**
-   * A token issued by the pre-15E.4b code (during the rolling deploy, or not
-   * live at backfill time) has no session. It gets one now, created and linked
-   * inside the refresh transaction; the link is a compare-and-set on
-   * session_id IS NULL, so of two concurrent first uses only one attaches —
-   * the other is refused, and its rollback discards the session it made.
-   * Removed by the 15E.4e contract step.
-   */
-  private async attachLegacySession(tx: Prisma.TransactionClient, tokenId: number, now: Date): Promise<number> {
-    const token = await tx.refreshToken.findUniqueOrThrow({
-      where: { id: tokenId },
-      select: { userId: true, createdAt: true, expiresAt: true },
-    });
-    const session = await tx.authSession.create({
-      data: {
-        userId: token.userId,
-        createdAt: token.createdAt,
-        absoluteExpiresAt: legacySessionExpiry(token.createdAt, token.expiresAt),
-        lastUsedAt: now,
-        ...sessionDeviceMetadata(),
-      },
-      select: { id: true },
-    });
-    const attached = await tx.refreshToken.updateMany({
-      where: { id: tokenId, sessionId: null, rotatedAt: null, revokedAt: null, expiresAt: { gt: now } },
-      data: { sessionId: session.id },
-    });
-    if (attached.count !== 1) throw new RefreshRejected();
-    return session.id;
-  }
-
-  /**
    * Ends the whole session the presented refresh token belongs to (Phase
    * 15E.4b). Possession of the token is the proof — no access token is
    * needed, so sign-out works after the access token has expired. The
@@ -426,23 +396,7 @@ export class AuthService {
     // Judged on a clock read AFTER the token: a refresh that committed just
     // before stamped rotatedAt with its own, possibly later, `now`.
     if (!presented || !mayEndSession(presented, new Date())) return;
-
-    let sessionId = presented.sessionId;
-    if (sessionId === null) {
-      // Legacy token, no session yet: it is the whole session.
-      const revoked = await tx.refreshToken.updateMany({
-        where: { id: presented.id, sessionId: null, revokedAt: null, expiresAt: { gt: now } },
-        data: { revokedAt: now },
-      });
-      if (revoked.count === 1) return;
-      // Lost to its concurrent first refresh. That UPDATE waited for the
-      // refresh to commit, so this fresh read sees the session it attached
-      // (the token is now rotated); end that session below. Nothing attached
-      // (revoked or expired instead) → nothing to end.
-      const attached = await tx.refreshToken.findUnique({ where: { id: presented.id }, select: { sessionId: true } });
-      if (!attached?.sessionId) return;
-      sessionId = attached.sessionId;
-    }
+    const sessionId = presented.sessionId;
 
     // Lock and revoke the session row first: a refresh in flight on this
     // session finishes before we continue (lock order: session, then tokens).
