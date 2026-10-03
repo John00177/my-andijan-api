@@ -21,6 +21,19 @@ export class ListClaimsAdminQueryDto {
   limit: number = 20;
 }
 
+// Phase 16 pilot policy: an approval must record HOW the claimant was verified
+// (e.g. "called the phone already on the listing"), stored as the APPROVE
+// audit row's note — there is deliberately no verification column on
+// BusinessClaim (no migration). Required, unlike most audit notes, because an
+// ownership grant with no recorded verification is exactly what claim
+// hijacking looks like after the fact.
+export class ApproveClaimDto {
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(1000)
+  verificationNote: string;
+}
+
 export class RejectClaimDto {
   @IsString()
   @IsNotEmpty()
