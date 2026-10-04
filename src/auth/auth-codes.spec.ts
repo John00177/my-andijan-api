@@ -441,6 +441,44 @@ describe('Authentication codes (Phase 15E.2)', () => {
     });
   });
 
+  // Phase 15 closeout: an SMS code alone must not take over a staff account
+  // through password reset any more than through OTP sign-in.
+  describe('SMS password reset is for customers and business owners only', () => {
+    it.each([UserRole.CUSTOMER, UserRole.BUSINESS_OWNER])('%s resets a password with an SMS code', async (role) => {
+      const user = addUser(role);
+      await auth.forgotPassword({ phone: PHONE });
+      await auth.resetPassword({ phone: PHONE, code: codeFromSms(), newPassword: 'new-password-1' });
+      expect(user.passwordHash).toBe('h:new-password-1');
+    });
+
+    it.each(STAFF)('%s gets no code: no SMS, nothing stored, answered exactly like an unknown phone', async (role) => {
+      const unknown = await auth.forgotPassword({ phone: '+998909999999' });
+      addUser(role);
+      mockBcrypt.hashCalls = 0;
+      const staff = await auth.forgotPassword({ phone: PHONE });
+      await settle();
+      expect(staff).toEqual(unknown);
+      expect(mockBcrypt.hashCalls).toBe(1); // same work as for an unknown phone
+      expect(sms.send).not.toHaveBeenCalled();
+      expect(db.otps).toHaveLength(0);
+    });
+
+    it.each(STAFF)('a code issued before the account became %s cannot reset it — refused, nothing changed', async (role) => {
+      const user = addUser(UserRole.CUSTOMER);
+      await auth.forgotPassword({ phone: PHONE });
+      const code = codeFromSms();
+      user.role = role;
+
+      const error = await auth.resetPassword({ phone: PHONE, code, newPassword: 'attacker-password' }).catch((e) => e);
+
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect(error.getResponse()).toEqual({ valid: false, message: "Noto'g'ri kod", statusCode: 400 });
+      expect(user.passwordHash).toBe('h:old-password');
+      expect(user.sessionVersion).toBe(0);
+      expect(db.audit).toHaveLength(0);
+    });
+  });
+
   describe('timing equalization', () => {
     it('forgot-password does the same bcrypt work and answers the same for unknown and known phones', async () => {
       const unknown = await auth.forgotPassword({ phone: '+998909999999' });
