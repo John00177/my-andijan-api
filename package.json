@@ -66,6 +66,9 @@
     "bcrypt@5.1.1": true,
     "prisma@5.22.0": true
   },
+  "overrides": {
+    "multer": "^2.4.0"
+  },
   "engines": {
     "node": "22.x"
   }

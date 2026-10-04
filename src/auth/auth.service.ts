@@ -51,10 +51,12 @@ const OTP_MAX_PER_WINDOW = 3;
 // keeps online brute force negligible.
 const CODE_FAILURE_WINDOW_MINUTES = 60;
 const MAX_CODE_FAILURES_PER_WINDOW = 5;
-// Who may sign in with an SMS code alone (Phase 15E.2). An allowlist, so any
-// role added later is refused by default: staff (SUPPORT, MODERATOR, ADMIN,
-// SUPER_ADMIN) must use their password — an SMS code is not a sufficient
-// factor for a privileged account.
+// Who may sign in, or reset a password, with an SMS code alone (Phase 15E.2;
+// password reset since the Phase 15 closeout). An allowlist, so any role added
+// later is refused by default: staff (SUPPORT, MODERATOR, ADMIN, SUPER_ADMIN)
+// must use their password — an SMS code (SIM swap, intercepted SMS) is not a
+// sufficient factor to take over a privileged account. Staff recover
+// credentials out of band, never through the public reset flow.
 const OTP_LOGIN_ROLES: ReadonlySet<UserRole> = new Set<UserRole>([UserRole.CUSTOMER, UserRole.BUSINESS_OWNER]);
 const INVALID_OTP_MESSAGE = "Kod noto'g'ri yoki muddati tugagan";
 const INVALID_RESET_CODE = { valid: false, message: "Noto'g'ri kod", statusCode: 400 };
@@ -686,10 +688,12 @@ export class AuthService {
     // registered — anything else is a phone-number enumeration oracle. A code
     // is generated and bcrypt-hashed either way; only a real account stores
     // it, and its SMS goes out in the background so delivery latency is not
-    // part of the response time either.
+    // part of the response time either. A staff account gets no code at all
+    // (OTP_LOGIN_ROLES) — answered exactly like an unknown phone, so the
+    // response says nothing about the account's role.
     const code = this.generateCode();
     const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
-    if (user && !user.deletedAt && user.status === UserStatus.ACTIVE) {
+    if (user && !user.deletedAt && user.status === UserStatus.ACTIVE && OTP_LOGIN_ROLES.has(user.role)) {
       const expiresAt = new Date(Date.now() + RESET_CODE_TTL_MINUTES * 60 * 1000);
       const issued = await this.issueCode(dto.phone, OtpPurpose.PASSWORD_RESET, codeHash, expiresAt);
       void this.deliverResetCode(dto.phone, code, issued.id);
@@ -739,6 +743,13 @@ export class AuthService {
       // Atomic single use (15E.2): a concurrent request with the same code
       // loses here, and its whole transaction — password included — rolls back.
       if (!(await this.consumeCode(tx, record.id))) {
+        throw new BadRequestException(INVALID_RESET_CODE);
+      }
+      // Defense in depth: forgotPassword never issues a code to staff, but a
+      // code issued before the account became staff must not reset it either.
+      // Same generic refusal as a wrong code; the whole transaction rolls back.
+      const target = await tx.user.findUnique({ where: { phone: dto.phone } });
+      if (!target || !OTP_LOGIN_ROLES.has(target.role)) {
         throw new BadRequestException(INVALID_RESET_CODE);
       }
       const user = await tx.user.update({
