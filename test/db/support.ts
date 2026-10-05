@@ -117,15 +117,48 @@ export function deployMigrations(workDir: string, databaseUrl: string): { ok: bo
   }
 }
 
+// ---------------------------------------------------------------------------
+// SIG Gate 2 runtime mode (npm run test:db:runtime): the application suites run
+// again with the application's client connected as TEST_DB_RUNTIME_ROLE
+// (runtime_app_public, after db/privileges/10_phase_a_boundary.sql) — proving
+// the PUBLIC runtime works with DML only. Fixture housekeeping the runtime is
+// deliberately not allowed to do (TRUNCATE) goes through a superuser client.
+// ---------------------------------------------------------------------------
+
+const RUNTIME_ROLE = process.env.TEST_DB_RUNTIME_ROLE;
+
+/** The URL the application connects with: the test database, as the runtime role in runtime mode. */
+function applicationDatabaseUrl(): string {
+  const url = new URL(testDatabaseUrl());
+  if (RUNTIME_ROLE) {
+    // The role has no password: runtime mode needs the local trust
+    // authentication CI's throwaway container uses (it fails, never passes, without it).
+    url.username = RUNTIME_ROLE;
+    url.password = '';
+  }
+  return url.toString();
+}
+
+let fixtureAdmin: PrismaClient | undefined;
+
+/** Closes the runtime-mode fixture client (test/db/runtime-after-env.ts). */
+export async function disconnectFixtureAdmin(): Promise<void> {
+  await fixtureAdmin?.$disconnect();
+  fixtureAdmin = undefined;
+}
+
 export function createTestPrisma(log = false): PrismaClient {
   return new PrismaClient({
-    datasources: { db: { url: testDatabaseUrl() } },
+    datasources: { db: { url: applicationDatabaseUrl() } },
     ...(log ? { log: [{ emit: 'event' as const, level: 'query' as const }] } : {}),
   });
 }
 
 export async function resetDatabase(prisma: PrismaClient): Promise<void> {
-  await prisma.$executeRawUnsafe(
+  const db = RUNTIME_ROLE
+    ? (fixtureAdmin ??= new PrismaClient({ datasources: { db: { url: testDatabaseUrl() } } }))
+    : prisma;
+  await db.$executeRawUnsafe(
     'TRUNCATE TABLE "refresh_tokens", "auth_sessions", "audit_logs", "otp_codes", "users" RESTART IDENTITY CASCADE',
   );
 }

@@ -66,5 +66,15 @@ jobs:
         env:
           TEST_DATABASE_URL: postgresql://postgres@localhost:5432/myandijan_test
 
+      # SIG Gate 2 (G2-C2): the application suites again, connected as
+      # runtime_app_public after the reviewed db/privileges/10_phase_a_boundary.sql
+      # — the PUBLIC runtime must work with DML only (no superuser, DDL or
+      # TRUNCATE). The privilege-boundary suite itself (Phase A, verification,
+      # INV-DB2 / RB-D1 sig_* isolation, rollback) runs in the step above.
+      - name: Run database tests as runtime_app_public
+        run: npm run test:db:runtime
+        env:
+          TEST_DATABASE_URL: postgresql://postgres@localhost:5432/myandijan_test
+
       - name: Build
         run: npm run build
