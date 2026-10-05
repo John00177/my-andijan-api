@@ -188,6 +188,52 @@ describe('R-E4 row counts (I-1)', () => {
     expect(counts(PROD_RAW.replace('_prisma_migrations|16', ''), RESTORE_RAW).stderr).toMatch(/_prisma_migrations missing/);
     expect(counts('BEGIN\r\nROLLBACK', RESTORE_RAW).stderr).toMatch(/no table\|count rows/);
   });
+
+  // Regression (PR #18 review, 2026-10-06): `grep -F '|' | grep -vqE` under
+  // pipefail let a malformed row through on large inputs — grep -q exits at the
+  // first match, the producer dies of SIGPIPE (141) and the `if` read that as
+  // "no match". Inputs of ~250 KB, far beyond any pipe buffer, and several runs
+  // each, because that failure was timing-dependent.
+  describe('large inputs (no early-exit fail-open)', () => {
+    const RUNS = 5;
+    const ROWS = 20_000;
+    const big = (insert: string, at: 'beginning' | 'middle' | 'end'): string => {
+      const rows = Array.from({ length: ROWS }, (_, i) => `t${i}|${i}`);
+      const pos = at === 'beginning' ? 0 : at === 'middle' ? ROWS / 2 : ROWS;
+      rows.splice(pos, 0, insert);
+      return ['BEGIN', '_prisma_migrations|16', ...rows, 'ROLLBACK'].join('\r\n');
+    };
+    const normalizeOnly = (raw: string): Run => {
+      const dir = mkdtempSync(join(work, 'big-'));
+      writeFileSync(join(dir, 'prod.raw'), raw);
+      const r = bash(`"${tool('counts.sh')}" normalize "${fwd(join(dir, 'prod.raw'))}" "${fwd(join(dir, 'prod.counts'))}"`);
+      expect(readdirSync(dir).filter((f) => f.includes('.tmp.'))).toEqual([]); // temp files always removed
+      return r;
+    };
+
+    it.each(['beginning', 'middle', 'end'] as const)('a malformed row at the %s of a large input always fails closed', (at) => {
+      for (let i = 0; i < RUNS; i++) {
+        const r = normalizeOnly(big('users|abc', at));
+        expect({ run: i, status: r.status }).toEqual({ run: i, status: 1 });
+        expect(r.stderr).toMatch(/malformed table\|count row/);
+      }
+    });
+
+    it('a corrupted count or a duplicated table hidden in a large input always fails closed', () => {
+      for (let i = 0; i < RUNS; i++) {
+        expect(normalizeOnly(big('users|25O', 'middle')).stderr).toMatch(/malformed table\|count row/);
+        const dup = normalizeOnly(big('t12345|12345', 'end'));
+        expect(dup.status).toBe(1);
+        expect(dup.stderr).toMatch(/listed more than once in .*: t12345/);
+      }
+    });
+
+    it('a large well-formed input still normalizes completely (not over-strict)', () => {
+      const r = normalizeOnly(big('users|250', 'middle'));
+      expect(r).toMatchObject({ status: 0 });
+      expect(r.stdout).toMatch(new RegExp(`${ROWS + 2} tables normalized; 2 non-row lines dropped`));
+    });
+  });
 });
 
 describe('R-E4 disposable restore check (I-4)', () => {
