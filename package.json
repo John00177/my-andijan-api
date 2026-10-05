@@ -19,7 +19,8 @@
     "db:seed": "ts-node prisma/seed.ts",
     "test": "jest",
     "test:watch": "jest --watch",
-    "test:db": "jest --config jest.db.config.js"
+    "test:db": "jest --config jest.db.config.js",
+    "test:db:runtime": "jest --config jest.db-runtime.config.js"
   },
   "prisma": {
     "seed": "ts-node prisma/seed.ts"
