@@ -11,9 +11,17 @@ generator client {
   provider = "prisma-client-js"
 }
 
+// SIG Gate 2, Phase C (RB-D2): migrations connect with directUrl, as
+// migration_owner (the owner of every application object); the application
+// connects with url — after Phase D as runtime_app_public, DML only.
+// `prisma migrate deploy` (Railway's pre-deploy command) fails with P1012 while
+// MIGRATION_DATABASE_URL is unset, so the owner sets it in Railway BEFORE this
+// lands (db/privileges/RUNBOOK.md, Phase B/C). `prisma generate` and the
+// client do not need it.
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("MIGRATION_DATABASE_URL")
 }
 
 // ============================================================================

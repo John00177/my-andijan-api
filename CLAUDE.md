@@ -143,6 +143,8 @@ Read directly from `process.env` — **there is no `@nestjs/config`, no validati
 
 **Required:** `DATABASE_URL`, `JWT_ACCESS_SECRET`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` (the last two are required for the API to **boot** — `UploadService`'s constructor throws without them).
 
+**Required for migrations:** `MIGRATION_DATABASE_URL` — the schema's `directUrl` (SIG Gate 2, Phase C). `prisma migrate deploy`, and so Railway's pre-deploy command, fails with P1012 without it; `prisma generate` and the running API do not need it. In production it connects as `migration_owner`; locally it may equal `DATABASE_URL`. The test harness sets it itself.
+
 **Optional:** `JWT_ACCESS_EXPIRES_IN` (default `15m`), `JWT_REFRESH_EXPIRES_IN` (default `30d`), `PORT` (default 3000), `ESKIZ_BASE_URL`, `ESKIZ_FROM`.
 
 **For real SMS:** `ESKIZ_EMAIL`, `ESKIZ_PASSWORD` — **currently unset on Railway**, so `POST /auth/otp/request` returns success while sending nothing.

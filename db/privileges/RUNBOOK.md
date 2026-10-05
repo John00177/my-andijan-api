@@ -270,6 +270,7 @@ Verified 2026-10-05 against this repository (Prisma 5.22, PostgreSQL 18):
 15. The rollback refuses while a role can log in.
 16. The rollback restores the original state, and Phase A re-applies cleanly.
 17. The R-E4 row-count query runs read-only.
+18. G2-C3 (Phase C): with this repository's `directUrl`, a new migration deploys as `migration_owner` while `DATABASE_URL` is the runtime, and is refused when both URLs are the runtime.
 
 `npm run test:db:runtime` re-runs the application suites with the application client connected as `runtime_app_public`
 after Phase A (G2-C2). It fails the run if the client is not that role.

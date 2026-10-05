@@ -1,5 +1,6 @@
 import { PrismaClient } from '@prisma/client';
-import { readFileSync, rmSync } from 'fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import {
   createTestPrisma,
   deployMigrations,
@@ -52,6 +53,28 @@ async function expectRefused(role: string, statement: string, reason: RegExp): P
   expect(String(refusal)).toMatch(reason);
 }
 
+/** The scratch database URL, logging in as `role` (no password: local trust authentication only). */
+function asLogin(role: string): string {
+  const url = new URL(scratch!.url);
+  url.username = role;
+  url.password = '';
+  return url.toString();
+}
+
+/** Waits until no backend is connected as a Gate 2 role (a finished CLI's session can linger briefly). */
+async function waitForGate2SessionsToEnd(): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    const [{ n }] = await db.$queryRawUnsafe<Array<{ n: number }>>(
+      `SELECT count(*)::int AS n FROM pg_stat_activity WHERE usename = ANY ($1::text[])`,
+      [...GATE2_ROLES],
+    );
+    if (n === 0) return;
+    if (Date.now() > deadline) throw new Error(`${n} session(s) still connected as Gate 2 roles`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
 async function currentUser(): Promise<string> {
   const [{ me }] = await db.$queryRawUnsafe<Array<{ me: string }>>('SELECT current_user AS me');
   return me;
@@ -93,6 +116,7 @@ describe('SIG Gate 2 database privilege boundary (db/privileges/, PostgreSQL 18)
     if (db && scratch && rolesCreatedHere && (await existingGate2Roles(db)).length > 0) {
       await db.$executeRawUnsafe('ALTER ROLE migration_owner NOLOGIN');
       await db.$executeRawUnsafe('ALTER ROLE runtime_app_public NOLOGIN');
+      await waitForGate2SessionsToEnd();
       const rolledBack = executeSqlFile(SQL.rollback, scratch.url);
       if (!rolledBack.ok) throw new Error(`cleanup rollback failed:\n${rolledBack.output}`);
     }
@@ -313,5 +337,45 @@ describe('SIG Gate 2 database privilege boundary (db/privileges/, PostgreSQL 18)
       WHERE ns.nspname = 'public' AND c.relkind IN ('r', 'p')`);
     expect(rows).toHaveLength(n);
     expect(rows.find((row) => row.table_name === '_prisma_migrations')?.row_count).toBe(BigInt(listMigrations().length));
+  });
+
+  // Runs last: it adds a migration to the scratch database.
+  it('G2-C3 (Phase C): prisma migrate deploy runs as migration_owner through directUrl while DATABASE_URL is the runtime; the runtime alone cannot migrate', async () => {
+    const PROBE = '29991231000000_g2_phase_c_probe';
+    const workDir = migrationsWorkDir(() => true); // includes this repository's schema.prisma, with directUrl
+    try {
+      mkdirSync(join(workDir, 'migrations', PROBE));
+      writeFileSync(
+        join(workDir, 'migrations', PROBE, 'migration.sql'),
+        [
+          'CREATE TABLE "g2_phase_c_probe" ("id" SERIAL PRIMARY KEY, "note" TEXT);',
+          '-- RUNBOOK.md §10: explicit runtime grants in the same migration',
+          'GRANT SELECT, INSERT, UPDATE, DELETE ON "g2_phase_c_probe" TO runtime_app_public;',
+          'GRANT USAGE, SELECT ON SEQUENCE "g2_phase_c_probe_id_seq" TO runtime_app_public;',
+        ].join('\n'),
+      );
+      // Phase B in miniature: both roles may log in — WITHOUT a password, so
+      // only the disposable cluster's local trust authentication admits them.
+      await db.$executeRawUnsafe('ALTER ROLE migration_owner LOGIN');
+      await db.$executeRawUnsafe('ALTER ROLE runtime_app_public LOGIN');
+
+      const runtimeOnly = deployMigrations(workDir, asLogin('runtime_app_public'), asLogin('runtime_app_public'));
+      expect(runtimeOnly.ok).toBe(false);
+      expect(runtimeOnly.output).toMatch(/permission denied/);
+
+      const deployed = deployMigrations(workDir, asLogin('runtime_app_public'), asLogin('migration_owner'));
+      expect(deployed).toMatchObject({ ok: true });
+    } finally {
+      await db.$executeRawUnsafe('ALTER ROLE migration_owner NOLOGIN');
+      await db.$executeRawUnsafe('ALTER ROLE runtime_app_public NOLOGIN');
+      rmSync(workDir, { recursive: true, force: true });
+    }
+
+    const recorded = await db.$queryRawUnsafe<Array<{ finished: boolean }>>(
+      `SELECT finished_at IS NOT NULL AS finished FROM _prisma_migrations WHERE migration_name = '${PROBE}'`,
+    );
+    expect(recorded).toEqual([{ finished: true }]);
+    expect(await ownersOfApplicationRelations()).toEqual(['migration_owner']);
+    expect(failures(await verify(db))).toEqual([]);
   });
 });
