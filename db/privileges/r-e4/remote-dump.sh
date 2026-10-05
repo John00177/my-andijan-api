@@ -1,0 +1,1 @@
+exec 4>&1; echo "G2RE4-BEGIN @NONCE@"; S=$( { { pg_dump -Fc -d railway; echo "$?" >&3; } | base64 -w 76 | awk '{ print; n++ } END { print "G2RE4-COUNT @NONCE@ " n+0 }' >&4; } 3>&1 ); echo "G2RE4-END @NONCE@ pg_dump_exit=${S:-missing}"

@@ -238,47 +238,142 @@ data; it is a last resort for data loss only, by explicit owner decision.
 
 ## 8. R-E4 — fresh dump and independently verified restore (owner)
 
-The dump contains production personal data and credential hashes. **Store it only in owner-controlled, encrypted
-storage.** Never put it in a repository folder, a synced folder without encryption, chat, CI, gate files or logs.
-Delete it when the owner's retention decision says so.
+The dump contains production personal data and credential hashes. **Everything R-E4 produces stays in one directory on
+owner-controlled, encrypted storage, `R_E4_DIR`**:
+- the framed stream;
+- the decoded dump;
+- both count files;
+- the disposable restore cluster's data directory and its log.
 
-1. **Dump** (read-only for production; one consistent snapshot). The base64 transport is immune to terminal line-ending translation over `railway ssh`:
-   ```bash
-   railway ssh -p <project> -s Postgres -e production -- "pg_dump -Fc -d railway | base64 -w 76" > railway-<stamp>.dump.b64
-   ```
-2. **Row counts on production, right after the dump:** `30_rowcounts_readonly.sql`, read-only, via the §6 transport, with `-At` added to the psql invocation and the output redirected to `prod.counts`.
-3. **Decode and fingerprint locally:**
-   ```bash
-   base64 -d -i railway-<stamp>.dump.b64 > railway-<stamp>.dump
-   ```
-   ```bash
-   sha256sum railway-<stamp>.dump
-   ```
-   ```bash
-   pg_restore --list railway-<stamp>.dump > /dev/null
-   ```
-   The table of contents must be readable. Record the SHA-256 and size in the gate log; they are not secrets.
-4. **Restore into a disposable PostgreSQL 18 instance, never production.** Use a throwaway local cluster: `initdb` in a temporary folder, its own port, listening on localhost only. Then:
-   ```bash
-   createdb -h localhost -p <port> -U postgres restore_check
-   ```
-   ```bash
-   pg_restore -h localhost -p <port> -U postgres --exit-on-error --single-transaction --no-owner --no-privileges -d restore_check railway-<stamp>.dump
-   ```
-5. **Verify:**
-   ```bash
-   psql -X -At -h localhost -p <port> -U postgres -d restore_check -f 30_rowcounts_readonly.sql > restore.counts
-   ```
-   ```bash
-   diff prod.counts restore.counts
-   ```
-   - `_prisma_migrations` must match exactly, and so must the number of tables.
-   - Per-table counts must match. The only exception is a table written to between the dump and the count, and any such difference must be explained, otherwise repeat from step 1.
-6. **Destroy the restored copy** (stop the cluster, delete its folder), record R-E4 = met in the gate log, then continue with Phase A.
+Never put any of it in a repository folder, an unencrypted synced folder, chat, CI, gate files or logs. The encrypted
+dump is kept according to the owner's retention decision, at least until Gate 2 closes, since it is Phase A's recovery
+point. The restore cluster is always destroyed.
 
-**Rehearsed** on PostgreSQL 18.4 with synthetic data (2026-10-05):
-- dump → base64 with injected CRLF → decode → TOC check → single-transaction restore → identical counts on 33 tables.
-- **The production transport over `railway ssh` itself is NOT VERIFIED until the window.** If it fails, STOP; do not improvise another channel.
+**Tools** in `db/privileges/r-e4/`. Run them in Git Bash from a clone of the repository at the merged commit.
+`.gitattributes` keeps their line endings LF.
+
+| File | Runs where | Purpose |
+|---|---|---|
+| `remote-dump.sh` | production container, via `railway ssh` (read-only) | `pg_dump -Fc`, base64-encoded between per-run markers, followed by the remote line count and `pg_dump`'s exit status (I-2, I-3) |
+| `unframe-dump.sh` | owner's machine | accepts the stream only if exactly this run's frame is present, intact and with `pg_dump_exit=0`; then decodes it (I-2, I-3) |
+| `counts.sh` | owner's machine | one deterministic `table\|count` format for production and restore, and the comparison (I-1) |
+| `restore-check.sh` | owner's machine | restore into a disposable PostgreSQL 18 cluster, then counts, with guaranteed cleanup (I-4) |
+
+The production command is pinned like the SQL files: SHA-256 of the committed bytes. CI fails if this table and the file
+disagree (`test/db/r-e4.db-spec.ts`).
+
+| File | SHA-256 |
+|---|---|
+| `r-e4/remote-dump.sh` | `18f0d33d7cbb23f5c0bd4d13966a4c90ca8272afc472b2eec50af9560288f724` |
+
+**Prerequisites, all supplied by the owner:**
+- the agreed window (E5), with the Step 1 preflight passed inside it;
+- the operator;
+- `R_E4_DIR` on encrypted storage, with enough free space (the last volume backup was about 119 MB);
+- PostgreSQL 18 binaries in `PG18_BIN` (default `D:/PostgreSQL/bin`; PATH is not used);
+- a free private port in `R_E4_PORT` (default 55499);
+- the `railway` CLI logged in with its registered SSH key;
+- the merged commit `REV`;
+- the retention decision.
+
+1. **Set up** (Git Bash, at the repository root). Set `R_E4_ENCRYPTED_STORAGE_CONFIRMED=yes` only after confirming the folder is encrypted; `restore-check.sh` refuses without it:
+   ```bash
+   export R_E4_DIR=<encrypted folder> R_E4_ENCRYPTED_STORAGE_CONFIRMED=yes PG18_BIN=D:/PostgreSQL/bin; REV=<merged commit SHA>; STAMP=$(date +%Y%m%d-%H%M); NONCE=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+   ```
+2. **Pin the production command.** Use the exact committed bytes and the fingerprint from the table above. Anything but `MATCH` is a STOP:
+   ```bash
+   git show "$REV:db/privileges/r-e4/remote-dump.sh" > "$R_E4_DIR/remote-dump.sh"
+   ```
+   ```bash
+   [ "$(sha256sum < "$R_E4_DIR/remote-dump.sh" | cut -c1-64)" = 18f0d33d7cbb23f5c0bd4d13966a4c90ca8272afc472b2eec50af9560288f724 ] && echo MATCH || echo "G2-STOP remote-dump fingerprint"
+   ```
+   ```bash
+   REMOTE=$(sed "s/@NONCE@/$NONCE/g" "$R_E4_DIR/remote-dump.sh" | tr -d '\r\n'); echo ${#REMOTE}
+   ```
+   The command is about 300 characters, far below the §6 transport limit.
+3. **Dump.** Read-only for production: one consistent `pg_dump` snapshot, and nothing is written in the container.
+   ```bash
+   railway ssh -p <project> -s Postgres -e production -- "$REMOTE" > "$R_E4_DIR/railway-$STAMP.framed"
+   ```
+   The stream is:
+   - `G2RE4-BEGIN <nonce>`;
+   - the base64 lines, 76 characters each;
+   - `G2RE4-COUNT <nonce> <number of lines>`;
+   - `G2RE4-END <nonce> pg_dump_exit=<status>`, printed only after `pg_dump` and the encoder have finished.
+4. **Row counts on production, right after the dump (I-1).** Run `30_rowcounts_readonly.sql` through the §6 guarded transport, with this psql invocation (the §6 read-only invocation plus `-At`), and write the output to `$R_E4_DIR/prod.raw`:
+   `PGOPTIONS='-c default_transaction_read_only=on' psql -X -At -v ON_ERROR_STOP=1 -P pager=off -d railway -c 'BEGIN TRANSACTION READ ONLY' -f - -c 'ROLLBACK'`
+
+   Then normalize:
+   ```bash
+   db/privileges/r-e4/counts.sh normalize "$R_E4_DIR/prod.raw" "$R_E4_DIR/prod.counts"
+   ```
+   `normalize` keeps exactly the `table|count` rows, sorted by table.
+   - psql's `BEGIN`/`ROLLBACK` tags, warnings and the CLI notice contain no `|`; they are dropped and counted.
+   - Any line with a `|` that is not a well-formed row fails closed, as does a duplicate table or a missing `_prisma_migrations`.
+5. **Verify and decode the stream (I-2, I-3):**
+   ```bash
+   db/privileges/r-e4/unframe-dump.sh "$R_E4_DIR/railway-$STAMP.framed" "$NONCE" "$R_E4_DIR/railway-$STAMP.dump"
+   ```
+   It succeeds only if all of these hold:
+   - this nonce's frame is present exactly once;
+   - every line inside the frame is strict base64 of the expected shape;
+   - the line count matches;
+   - `pg_dump_exit=0`;
+   - the decoded data starts like a custom-format archive.
+
+   Lines outside the frame, such as the CLI's "Using SSH key …" notice, are counted but never decoded or shown. On any failure it writes no dump: STOP.
+
+   Record the printed size and SHA-256 in the gate log; they are not secrets.
+
+   `"$PG18_BIN/pg_restore" --list` on the file shows that its table of contents is readable. **It does not prove the dump is complete.** Completeness is proven by the frame (this step) and the full restore (step 6).
+6. **Restore check on a disposable PostgreSQL 18 cluster (I-4):**
+   ```bash
+   db/privileges/r-e4/restore-check.sh "$R_E4_DIR/railway-$STAMP.dump" "$R_E4_DIR/prod.counts"
+   ```
+   The script, in order:
+   1. refuses unless `R_E4_ENCRYPTED_STORAGE_CONFIRMED=yes` and both files are inside `R_E4_DIR`;
+   2. checks that `PG18_BIN` is PostgreSQL 18, and that `30_rowcounts_readonly.sql` matches its §6 fingerprint;
+   3. refuses if `R_E4_PORT` is already serving PostgreSQL;
+   4. `"$PG18_BIN/initdb" -D "$R_E4_DIR/restore-pgdata-<time>" -U postgres -A trust -E UTF8 --locale=C`;
+   5. `"$PG18_BIN/pg_ctl" -D <data> -o "-p $R_E4_PORT -c listen_addresses=localhost" -l <data>.log -w start`;
+   6. `createdb restore_check`;
+   7. `pg_restore --exit-on-error --single-transaction --no-owner --no-privileges -d restore_check`;
+   8. `psql -X -q -At -f 30_rowcounts_readonly.sql`;
+   9. `counts.sh normalize`, then `compare`.
+
+   A trap **always** runs `pg_ctl … stop` (fast, then immediate) and deletes the data directory and its log, after failures too, and prints `cleanup done`. If the deletion fails, it says so: STOP and delete manually. The server listens on localhost only and exists only while the script runs.
+
+   Exit status:
+
+   | Status | Meaning |
+   |---|---|
+   | 0 | MATCH |
+   | 2 | per-table differences: STOP, unless each is a table written to between the dump and the count, explained and recorded; otherwise repeat from step 3 |
+   | 1 | anything else: STOP |
+
+   `_prisma_migrations` and the table set must always match exactly.
+7. **Record** in the gate log: times, dump size and SHA-256, the restore-check exit status and table count, and `cleanup done`. R-E4 is then met, and Phase A may be authorized. Keep the encrypted dump per the retention decision. Delete `remote-dump.sh`, `*.framed` and `*.raw` from `R_E4_DIR` when no longer needed.
+
+Any non-zero exit in steps 2–6 is a STOP (stop conditions 1 and 4).
+
+**Proven locally** on synthetic data (2026-10-06, `test/db/r-e4.db-spec.ts`):
+- The production command was run by `sh` with a stand-in `pg_dump`.
+- A valid stream, surrounded by a CLI notice and CR line endings, decoded byte for byte.
+- The following failed closed with no dump written:
+  - noise or an injected marker inside the frame;
+  - a stream cut mid-payload or before END;
+  - a lost payload line;
+  - `pg_dump` exit 1;
+  - a foreign or stale nonce;
+  - a second frame;
+  - a non-archive payload.
+- Counts with psql tags and warnings matched clean restore counts.
+- A per-table difference gave exit 2.
+- A `_prisma_migrations` or table-set difference gave exit 1.
+- End to end on PostgreSQL 18.4, with a disposable source cluster built from every migration: real `pg_dump` through `remote-dump.sh`, then unframe, counts, and `restore-check.sh` gave MATCH. A later write gave exit 2. Cleanup left no data directory.
+
+**The production transport over `railway ssh` itself is NOT VERIFIED until the window.** If it fails, STOP; do not
+improvise another channel.
 
 ## 9. RB-D2 verification — how migrations get their own role
 
