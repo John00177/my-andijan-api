@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { BusinessStatus, ClaimStatus, EventStatus, Prisma, ReviewStatus } from '@prisma/client';
+import { AuditAction, BusinessStatus, ClaimStatus, EventStatus, Prisma, ReviewStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { auditRequestFields } from '../common/request-context/request-context';
 import { ReviewsService } from '../reviews/reviews.service';
 import { EventsService } from '../events/events.service';
 import { HealthScoreService } from '../health-score/health-score.service';
@@ -527,17 +528,39 @@ export class OwnerService {
       throw new ConflictException('You already have a pending claim for this business');
     }
 
-    return this.prisma.businessClaim.create({
-      data: {
-        businessId: dto.businessId,
-        claimantId: user.id,
-        evidence: dto.evidence,
-        contactPhone: dto.contactPhone,
-        contactNote: dto.contactNote,
-      },
-      include: {
-        business: { select: { id: true, slug: true, name: true } },
-      },
+    // Filing a claim is audited like the staff decision on it (Phase 16C.1),
+    // in the same transaction so a claim never exists without its row. The
+    // audit row records only which business and the resulting status — the
+    // claimant's evidence and contact details stay on the claim itself
+    // (readable by the claimant and `claim.review` holders) rather than being
+    // copied into the broader audit log.
+    return this.prisma.$transaction(async (tx) => {
+      const claim = await tx.businessClaim.create({
+        data: {
+          businessId: dto.businessId,
+          claimantId: user.id,
+          evidence: dto.evidence,
+          contactPhone: dto.contactPhone,
+          contactNote: dto.contactNote,
+        },
+        include: {
+          business: { select: { id: true, slug: true, name: true } },
+        },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          ...auditRequestFields(),
+          actorId: user.id,
+          action: AuditAction.CREATE,
+          entityType: 'BusinessClaim',
+          entityId: claim.id,
+          before: {} as Prisma.InputJsonValue,
+          after: { businessId: claim.businessId, status: claim.status } as Prisma.InputJsonValue,
+        },
+      });
+
+      return claim;
     });
   }
 }
