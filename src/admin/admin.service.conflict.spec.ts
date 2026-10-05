@@ -89,7 +89,7 @@ describe('AdminService — conflict-of-interest refusals', () => {
 
   it("refuses to decide the actor's own claim (approve and reject)", async () => {
     prisma.businessClaim.findUnique.mockResolvedValue({ id: 1, claimantId: ACTOR, businessId: 5, status: ClaimStatus.PENDING });
-    await expect(service.approveClaim(1, ACTOR)).rejects.toThrow(ForbiddenException);
+    await expect(service.approveClaim(1, ACTOR, { verificationNote: 'x' })).rejects.toThrow(ForbiddenException);
     await expect(service.rejectClaim(1, ACTOR, { reason: 'x' })).rejects.toThrow(ForbiddenException);
     expect(prisma.business.updateMany).not.toHaveBeenCalled();
     expect(prisma.businessClaim.updateMany).not.toHaveBeenCalled();
