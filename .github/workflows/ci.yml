@@ -23,10 +23,12 @@ jobs:
     # database. It lives and dies with this job, is reachable only from the
     # runner, and holds no data but what the tests create — so it uses trust
     # authentication and needs no credential at all. Pinned by digest
-    # (postgres:16-alpine, multi-arch index).
+    # (postgres:18.6-alpine, multi-arch index). Production runs PostgreSQL
+    # 18.6 (SIG Gate 2 pre-check), so the suites test the same major and minor
+    # version (SIG U14; was postgres:16-alpine).
     services:
       postgres:
-        image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        image: postgres:18.6-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: myandijan_test
