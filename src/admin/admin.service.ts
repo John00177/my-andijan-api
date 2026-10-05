@@ -190,6 +190,60 @@ export class AdminService {
     return { data, meta: paginate(page, limit, total) };
   }
 
+  // MODERATOR+ (`business.review`, Phase 16E). One listing in full, for the
+  // review drawer: GET /businesses/:id serves only APPROVED listings and
+  // GET /me/businesses/:id only the owner, so staff had no way to see a
+  // PENDING listing's hours, photos, other branches or coordinates before
+  // deciding. Any status except soft-deleted; same owner-contact shaping as
+  // the queue (D-72). Deliberately a read-only projection: no products,
+  // events or reviews, and photos without their uploader.
+  async findBusinessById(id: number, viewerRole: UserRole) {
+    const ownerSelect = canSeeContactDetails(viewerRole)
+      ? { id: true, fullName: true, phone: true, email: true }
+      : { id: true, fullName: true };
+
+    const business = await this.prisma.business.findFirst({
+      where: { id, deletedAt: null },
+      include: {
+        owner: { select: ownerSelect },
+        category: { select: { id: true, slug: true, nameUz: true } },
+        businessType: { select: { id: true, slug: true, nameUz: true } },
+        branches: {
+          where: { deletedAt: null },
+          // Primary first — the branch the admin hours/branch edits target.
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            address: true,
+            landmark: true,
+            phone: true,
+            phoneAlt: true,
+            lat: true,
+            lng: true,
+            isPrimary: true,
+            isActive: true,
+            district: { select: { id: true, slug: true, nameUz: true } },
+            city: { select: { id: true, slug: true, nameUz: true } },
+            hours: {
+              orderBy: { dayOfWeek: 'asc' },
+              select: { dayOfWeek: true, openTime: true, closeTime: true, isClosed: true, is24Hours: true },
+            },
+            // Explicit select: never the uploader (uploadedById) or storage ids.
+            photos: {
+              orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+              select: { url: true, thumbUrl: true, caption: true, isPrimary: true, sortOrder: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!business) throw new NotFoundException(`Business ${id} not found`);
+    return business;
+  }
+
   async approveBusiness(id: number, adminId: number) {
     return this.prisma.$transaction(async (tx) => {
       const business = await this.getPendingBusiness(tx, id, adminId);
