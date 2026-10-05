@@ -9,6 +9,7 @@
   "GET /admin/analytics/users": "capability:analytics.users",
   "GET /admin/audit": "capability:audit.read",
   "GET /admin/businesses": "capability:business.review",
+  "GET /admin/businesses/:id": "capability:business.review",
   "GET /admin/categories": "capability:taxonomy.manage",
   "GET /admin/claims": "capability:claim.review",
   "GET /admin/command-center/business-health": "capability:analytics.platform",

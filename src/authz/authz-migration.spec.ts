@@ -150,6 +150,12 @@ const LEGACY: Record<string, Legacy> = {
   'POST /upload/image': 'auth',
   'GET /users/me': 'auth',
   'PATCH /users/me': 'auth',
+  // ---- Added AFTER fda2390 — these routes did not exist under the rank model.
+  // Each is recorded at the rank floor of the route group it joins, so this
+  // comparison still proves the new route is no wider than its siblings.
+  // Phase 16E: the review drawer's listing detail, joining the MODERATOR
+  // business queue (GET /admin/businesses, approve, reject).
+  'GET /admin/businesses/:id': 'MODERATOR',
 };
 
 function legacyDecision(rule: Legacy, role: UserRole | null): 'allow' | 'unauthenticated' | 'forbidden' {
