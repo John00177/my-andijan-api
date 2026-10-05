@@ -28,7 +28,7 @@ import {
   UpdateBusinessBranchDto,
   UpdateBusinessDto,
 } from './dto/business.dto';
-import { ListClaimsAdminQueryDto, RejectClaimDto } from './dto/claim.dto';
+import { ApproveClaimDto, ListClaimsAdminQueryDto, RejectClaimDto } from './dto/claim.dto';
 import { ListReportsQueryDto, ReportResolveAction, ResolveReportDto } from './dto/report.dto';
 import { ListEventsAdminQueryDto, RejectEventDto } from './dto/event.dto';
 import { CreateCategoryDto, ReorderCategoryItemDto, UpdateCategoryDto } from './dto/category.dto';
@@ -688,16 +688,25 @@ export class AdminService {
   // approve/reject can match `status = PENDING`. A lost race throws, which
   // rolls back the whole interactive transaction — so ownership is never
   // assigned without the claim being APPROVED, and vice versa.
-  async approveClaim(id: number, adminId: number) {
+  //
+  // Phase 16C.1: a claim can sit PENDING while the world moves on — the
+  // listing gets suspended, hidden or deleted, the claimant gets suspended or
+  // deleted. createClaim only checked those at filing time, so approval
+  // re-checks them here, before any write. The business-side conditions are
+  // also part of the ownership compare-and-set below, so a concurrent
+  // suspend/hide/delete can't slip in between the check and the write.
+  async approveClaim(id: number, adminId: number, dto: ApproveClaimDto) {
     return this.prisma.$transaction(async (tx) => {
       const claim = await this.getPendingClaim(tx, id, adminId);
+      await this.assertBusinessStillClaimable(tx, claim.businessId);
+      const claimant = await this.getActiveClaimant(tx, claim.claimantId);
 
       const assigned = await tx.business.updateMany({
-        where: { id: claim.businessId, ownerId: null },
+        where: { id: claim.businessId, ownerId: null, status: BusinessStatus.APPROVED, deletedAt: null },
         data: { ownerId: claim.claimantId },
       });
       if (assigned.count === 0) {
-        throw new ConflictException(`Business ${claim.businessId} already has an owner`);
+        throw new ConflictException(`Business ${claim.businessId} already has an owner or is no longer approved`);
       }
       await this.writeAudit(
         tx,
@@ -722,9 +731,9 @@ export class AdminService {
         id,
         { status: ClaimStatus.PENDING },
         { status: updatedClaim.status },
+        dto.verificationNote,
       );
 
-      const claimant = await tx.user.findUniqueOrThrow({ where: { id: claim.claimantId } });
       if (claimant.role === UserRole.CUSTOMER) {
         await tx.user.update({ where: { id: claimant.id }, data: { role: UserRole.BUSINESS_OWNER } });
         await this.writeAudit(
@@ -806,6 +815,34 @@ export class AdminService {
       throw new ConflictException(`Claim ${id} has already been reviewed (status: ${claim.status})`);
     }
     return claim;
+  }
+
+  // 409, matching the other "state changed under you" refusals: the claim
+  // itself is fine, its target no longer is.
+  private async assertBusinessStillClaimable(tx: Prisma.TransactionClient, businessId: number) {
+    const business = await tx.business.findUnique({ where: { id: businessId } });
+    if (!business) {
+      throw new ConflictException(`Business ${businessId} no longer exists`);
+    }
+    if (business.deletedAt) {
+      throw new ConflictException(`Business ${businessId} has been deleted`);
+    }
+    if (business.status !== BusinessStatus.APPROVED) {
+      throw new ConflictException(`Business ${businessId} is no longer approved (current status: ${business.status})`);
+    }
+  }
+
+  // Ownership is never granted to a suspended or deleted account, however
+  // long ago it filed the claim.
+  private async getActiveClaimant(tx: Prisma.TransactionClient, claimantId: number) {
+    const claimant = await tx.user.findUnique({ where: { id: claimantId } });
+    if (!claimant || claimant.deletedAt || claimant.status === UserStatus.DELETED) {
+      throw new ConflictException(`Claimant ${claimantId} no longer has an active account`);
+    }
+    if (claimant.status !== UserStatus.ACTIVE) {
+      throw new ConflictException(`Claimant ${claimantId} is not active (current status: ${claimant.status})`);
+    }
+    return claimant;
   }
 
   // The early getPendingClaim() read gives a friendly 404/409; this

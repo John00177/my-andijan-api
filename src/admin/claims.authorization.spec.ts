@@ -2,6 +2,7 @@ import { UserRole } from '@prisma/client';
 import { AdminController } from './admin.controller';
 import { OwnerController } from '../owner/owner.controller';
 import { decide, ruleOf } from '../authz/decide';
+import { ApproveClaimDto } from './dto/claim.dto';
 
 // REAL controller metadata, decided by AuthzGuard's own decision function
 // (Phase 15D, D-75). Fails if anyone loosens a claim route's capability.
@@ -37,6 +38,14 @@ describe('Claim route authorization', () => {
       });
     });
   }
+
+  // Phase 16C.1: the capability alone is not enough to approve — the body must
+  // carry a verification note. The global ValidationPipe enforces the DTO the
+  // handler declares, so pin that declaration here.
+  it('POST /admin/claims/:id/approve binds ApproveClaimDto (verification note required)', () => {
+    const paramTypes: unknown[] = Reflect.getMetadata('design:paramtypes', AdminController.prototype, 'approveClaim');
+    expect(paramTypes).toContain(ApproveClaimDto);
+  });
 
   describe('POST/GET /me/claims (filing a claim)', () => {
     const handlers = [OwnerController.prototype.createClaim, OwnerController.prototype.findMyClaims];

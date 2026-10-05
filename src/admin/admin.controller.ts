@@ -22,7 +22,7 @@ import {
   UpdateBusinessBranchDto,
   UpdateBusinessDto,
 } from './dto/business.dto';
-import { ListClaimsAdminQueryDto, RejectClaimDto } from './dto/claim.dto';
+import { ApproveClaimDto, ListClaimsAdminQueryDto, RejectClaimDto } from './dto/claim.dto';
 import { ListReportsQueryDto, ResolveReportDto } from './dto/report.dto';
 import { ListEventsAdminQueryDto, RejectEventDto } from './dto/event.dto';
 import { CreateCategoryDto, ReorderCategoryItemDto, UpdateCategoryDto } from './dto/category.dto';
@@ -180,10 +180,16 @@ export class AdminController {
     return this.adminService.findClaims(query);
   }
 
+  // Requires a verificationNote (ApproveClaimDto) — how the claimant was
+  // verified, recorded on the audit row (Phase 16C.1).
   @RequireCapability('claim.review')
   @Post('claims/:id/approve')
-  approveClaim(@Param('id', ParseIntPipe) id: number, @CurrentUser() admin: AuthenticatedUser) {
-    return this.adminService.approveClaim(id, admin.id);
+  approveClaim(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() admin: AuthenticatedUser,
+    @Body() dto: ApproveClaimDto,
+  ) {
+    return this.adminService.approveClaim(id, admin.id, dto);
   }
 
   @RequireCapability('claim.review')
