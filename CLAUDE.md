@@ -46,7 +46,7 @@ npm run build
 - `postinstall` runs `prisma generate`.
 - `docker compose` gives you `postgres:16` as `andijan` / `my_andijan` on 5432.
 - **`npm run lint` and `npm run format` are broken** — they invoke `eslint` and `prettier`, **neither of which is in `devDependencies`**. Do not rely on them; do not assume lint passed.
-- **Tests:** `npm test` runs the unit suites (`src/**/*.spec.ts`, no database). `npm run test:db` runs the real-PostgreSQL suites in `test/db/` (refresh-token sessions and concurrency, migration backfill — Phase 15E.4b). It needs `TEST_DATABASE_URL`: a disposable **local** database whose name contains `test`. The suites truncate tables and refuse anything else. CI runs both inside `test-and-build`, against a throwaway `postgres:16-alpine` service container.
+- **Tests:** `npm test` runs the unit suites (`src/**/*.spec.ts`, no database). `npm run test:db` runs the real-PostgreSQL suites in `test/db/` (refresh-token sessions and concurrency, migration backfill — Phase 15E.4b). It needs `TEST_DATABASE_URL`: a disposable **local** database whose name contains `test`. The suites truncate tables and refuse anything else. CI runs both inside `test-and-build`, against a throwaway `postgres:18.6-alpine` service container (production runs PostgreSQL 18.6; SIG U14). `docker compose` still uses `postgres:16` for local development: a PostgreSQL 18 image cannot reuse the existing 16 data volume.
 
 ### Windows shell notes
 - Use **`npx.cmd` / `npm.cmd`** in PowerShell — the execution policy blocks `*.ps1` wrapper scripts.
