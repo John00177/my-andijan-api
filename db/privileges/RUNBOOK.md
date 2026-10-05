@@ -55,7 +55,7 @@ completely: the database is left exactly as it was.
 STOP, change nothing further, and report to the owner when:
 
 1. any file raises a **`G2-STOP`** exception, or any command exits non-zero;
-2. a SQL file's SHA-256 inside the container differs from the merged file's (§6 transport);
+2. a SQL file's SHA-256 differs from its fingerprint in the §6 table, locally or inside the container (the transport guard prints `G2-STOP transport`), or a transport command is 7,500 characters or longer (§6 transport);
 3. the Step 1 preflight differs from the expectations in §6;
 4. R-E4 is not met: no fresh dump, the dump cannot be transported intact, the isolated restore fails, or the row counts do not reconcile;
 5. a step would expose a secret (password, hash, token, connection string), or statement logging would record one (P19);
@@ -73,28 +73,86 @@ with the PostgreSQL 18 privilege suites green in CI. Record the merged commit SH
 
 ## 6. Procedure
 
-### Transport: how a SQL file reaches production
+### Transport: how a SQL file reaches production (F-6)
 
-Production has no public database endpoint. Each file therefore travels base64-encoded through `railway ssh` into the
-`Postgres` container. `psql` there uses the container's own `PG*` environment, so no credential is typed or printed.
-Run from a checkout of the merged commit, in Git Bash, in `db/privileges/`. For a file `F`:
+Production has no public database endpoint, and **`railway ssh` truncates a command at about 8 KB**. That was observed
+on 2026-10-05: a longer command arrived cut short, and nothing after the cut ran.
+- In plain base64, `10_phase_a_boundary.sql` alone is about 24.6 KB.
+- So each SQL file travels **gzip-compressed and base64-encoded inside one command**.
+- It is decompressed in the `Postgres` container and executed **only if** the SHA-256 of the decompressed SQL equals its fingerprint below.
+- `psql` there uses the container's own `PG*` environment, so no credential is typed or printed.
+- The container's `gzip`/`gunzip` was confirmed during the 2026-10-05 E3 preflight.
 
-```bash
-sha256sum "$F"
-```
-```bash
-B64=$(base64 -w0 "$F")
-```
-```bash
-railway ssh -p <project> -s Postgres -e production -- "echo $B64 | base64 -d | sha256sum"
-```
-The two hashes must be identical (stop condition 2). The `psql` invocations below are executed as
-`railway ssh -p <project> -s Postgres -e production -- "echo $B64 | base64 -d | <psql invocation>"`.
+**Expected fingerprints.** SHA-256 of the exact committed bytes, with LF line endings, as merged on `main`. CI fails if
+this table and the files ever disagree (`test/db/runbook-transport.db-spec.ts`).
 
-| Kind | psql invocation (stdin = the file) |
+| File | SHA-256 |
+|---|---|
+| `00_preflight_readonly.sql` | `9e39c5f04721f093b7a1446a155cb5f2c2a90ffee3b2c22b6a36e4f57d3edd28` |
+| `10_phase_a_boundary.sql` | `25c0478c923bf3429bc49d2240e61a990c3b347236e43e5a31654ccf312ea6cb` |
+| `20_verify_readonly.sql` | `fb07a72dbfbd824614d8f488f99dfd86318a118e216fb17248343cca43d12070` |
+| `30_rowcounts_readonly.sql` | `fa806fc40637fce70dc483c8b2f1e833a51a90ffbbe114ac8a7a64082a002da4` |
+| `90_rollback_phase_a.sql` | `b9f55bb81c5396ba111bf18d1d9f018bd465e42ab90acd49755a19104a423201` |
+
+**Procedure, for one file `F`.** Run in Git Bash, in any clone of this repository.
+
+1. Set the file and the merged commit recorded at Step 0:
+   ```bash
+   F=10_phase_a_boundary.sql; REV=<merged commit SHA>; EXPECTED=<fingerprint of F from the table>; T=$(mktemp -d)
+   ```
+2. Take the **exact committed bytes**, never a working-tree copy. A Windows checkout can have CRLF line endings, which change the fingerprint:
+   ```bash
+   git show "$REV:db/privileges/$F" > "$T/$F"
+   ```
+3. Check the fingerprint locally. Anything but `MATCH` is a STOP (stop condition 2):
+   ```bash
+   [ "$(sha256sum < "$T/$F" | cut -c1-64)" = "$EXPECTED" ] && echo MATCH || echo "G2-STOP local fingerprint"
+   ```
+4. Compress the exact file and base64-encode the compressed payload:
+   ```bash
+   GZ=$(gzip -9 -n -c "$T/$F" | base64 -w0)
+   ```
+5. Build the guarded command. `<psql invocation>` comes from the table below. The guard decompresses the payload in the container, hashes it, and runs `psql` only when the hash equals `EXPECTED`. Otherwise it prints `G2-STOP transport` and exits 3 without touching the database:
+   ```bash
+   CMD="P=$GZ; if [ \"\$(echo \$P | base64 -d | gunzip | sha256sum | cut -c1-64)\" = $EXPECTED ]; then echo \$P | base64 -d | gunzip | <psql invocation>; else echo 'G2-STOP transport: SHA-256 mismatch, nothing executed'; exit 3; fi"
+   ```
+6. Check the length. It must be **below 7,500**; otherwise STOP. A command the transport cut short could only run an assignment, never `psql`, but do not rely on that:
+   ```bash
+   echo ${#CMD}
+   ```
+7. **Optional, recommended before every write file:** a dry transport. Use the same `CMD` with `<psql invocation>` replaced by `wc -c`; it prints the byte count without touching the database.
+8. Run:
+   ```bash
+   railway ssh -p <project> -s Postgres -e production -- "$CMD"
+   ```
+
+| Kind | psql invocation (stdin = the decompressed, verified file) |
 |---|---|
 | read-only (`00`, `20`, `30`) | `PGOPTIONS='-c default_transaction_read_only=on' psql -X -v ON_ERROR_STOP=1 -P pager=off -d railway -c 'BEGIN TRANSACTION READ ONLY' -f - -c 'ROLLBACK'` |
 | write (`10`, `90`) | `psql -X -v ON_ERROR_STOP=1 -d railway -f -` |
+
+`00_preflight_readonly.sql` brings its own `BEGIN TRANSACTION READ ONLY … ROLLBACK`. With the read-only invocation, psql
+then reports the outer `BEGIN`/`ROLLBACK` as warnings ("already"/"no transaction in progress"). These are not errors.
+
+Measured command lengths for the files above, without the project placeholder:
+
+| File | Command length |
+|---|---|
+| `00` | 3,451 |
+| `10` | 6,031 |
+| `20` | 4,211 |
+| `30` | 1,407 |
+| `90` | 2,691 |
+
+These were measured on 2026-10-05 with the step 5 command and its psql invocation. All are below the limit. CI checks
+every file's command length.
+
+The procedure was proven on 2026-10-05 against a disposable PostgreSQL 18 cluster, with the container emulated by
+`sh -c`, as the step 5 command:
+- read-only runs (`00`, `20`, `30`) and write runs (`10`, `90`) executed only after a fingerprint match;
+- a tampered fingerprint printed `G2-STOP transport` and exited 3, creating no role;
+- a command cut short ran no SQL;
+- Phase A, then V01–V12 `PASS`, then rollback, all worked through it.
 
 ### Step 0 — Open the window (owner)
 Record the start time, operator and runbook commit SHA in the gate-02 `SESSION_LOG.md`.
@@ -112,7 +170,14 @@ Record the start time, operator and runbook commit SHA in the gate-02 `SESSION_L
 - P15: 20 enum types owned by `postgres`.
 - P16: no Gate 2 roles.
 - P17: no `sig_*` objects.
-- P18: database ACLs NULL.
+- P14 and P18 (F-7): **exactly** these four databases with these ACLs. Any other database, or any other ACL value, is a STOP:
+
+  | Database | Expected ACL |
+  |---|---|
+  | `postgres` | NULL (built-in default: PUBLIC may CONNECT and create TEMP tables) |
+  | `railway` | NULL (built-in default: PUBLIC may CONNECT and create TEMP tables) |
+  | `template0` | `{=c/postgres,postgres=CTc/postgres}`, PostgreSQL's standard `initdb` ACL (PUBLIC may only CONNECT) |
+  | `template1` | `{=c/postgres,postgres=CTc/postgres}`, PostgreSQL's standard `initdb` ACL (PUBLIC may only CONNECT) |
 - P19: `log_statement = none`, `password_encryption = scram-sha-256`.
 
 ### Step 2 — R-E4: fresh dump + verified isolated restore (owner) — see §8
@@ -273,3 +338,7 @@ Verified 2026-10-05 against this repository (Prisma 5.22, PostgreSQL 18):
 
 `npm run test:db:runtime` re-runs the application suites with the application client connected as `runtime_app_public`
 after Phase A (G2-C2). It fails the run if the client is not that role.
+
+`test/db/runbook-transport.db-spec.ts` (part of `test:db`) checks the §6 transport (F-6). The fingerprint table must
+list every SQL file in this directory with its exact SHA-256 (committed LF bytes), and every file's gzip + base64
+transport command must stay below 7,500 characters.
