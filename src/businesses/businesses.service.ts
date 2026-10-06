@@ -130,8 +130,22 @@ export class BusinessesService {
       status: BusinessStatus.APPROVED,
       deletedAt: null,
       ...(query.category ? { category: { slug: query.category } } : {}),
-      ...(query.district ? { branches: { some: { districtId: query.district, deletedAt: null } } } : {}),
-      ...(query.city ? { branches: { some: { cityId: query.city, deletedAt: null } } } : {}),
+      // One `branches` condition carrying both location filters (Phase 16F.3):
+      // two separate spreads wrote the same key, so with district AND city
+      // supplied the city filter silently replaced the district filter. Both
+      // must hold on the SAME live branch — as in SearchService's
+      // `br.district_id = … AND br.city_id = …`.
+      ...(query.district || query.city
+        ? {
+            branches: {
+              some: {
+                ...(query.district ? { districtId: query.district } : {}),
+                ...(query.city ? { cityId: query.city } : {}),
+                deletedAt: null,
+              },
+            },
+          }
+        : {}),
       ...(query.search
         ? { name: { contains: query.search, mode: Prisma.QueryMode.insensitive } }
         : {}),

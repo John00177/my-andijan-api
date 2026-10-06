@@ -57,6 +57,63 @@ describe('BusinessesService', () => {
       const call = prisma.business.findMany.mock.calls[0][0];
       expect(call.where.name).toEqual({ contains: 'osh', mode: 'insensitive' });
     });
+
+    // Phase 16F.3: district and city used to be two spreads writing the same
+    // `branches` key, so with both supplied the city filter silently replaced
+    // the district filter. Both now constrain the SAME live branch — as the
+    // search service's `br.district_id = … AND br.city_id = …` does.
+    describe('location filters', () => {
+      beforeEach(() => {
+        prisma.business.findMany.mockResolvedValue([]);
+        prisma.business.count.mockResolvedValue(0);
+      });
+
+      function whereOf(callIndex = 0) {
+        return prisma.business.findMany.mock.calls[callIndex][0].where;
+      }
+
+      it('filters by district alone, exactly as before', async () => {
+        await service.findAll({ district: 3 } as any);
+
+        expect(whereOf().branches).toEqual({ some: { districtId: 3, deletedAt: null } });
+      });
+
+      it('filters by city alone, exactly as before', async () => {
+        await service.findAll({ city: 7 } as any);
+
+        expect(whereOf().branches).toEqual({ some: { cityId: 7, deletedAt: null } });
+      });
+
+      it('enforces district AND city together, on the same live branch', async () => {
+        await service.findAll({ district: 3, city: 7 } as any);
+
+        expect(whereOf().branches).toEqual({ some: { districtId: 3, cityId: 7, deletedAt: null } });
+      });
+
+      it('adds no branch constraint when neither is supplied', async () => {
+        await service.findAll({} as any);
+
+        expect(whereOf()).not.toHaveProperty('branches');
+      });
+
+      it('leaves the other filters intact alongside both location filters', async () => {
+        await service.findAll({ district: 3, city: 7, category: 'oziq-ovqat', search: 'osh' } as any);
+
+        expect(whereOf()).toEqual({
+          status: BusinessStatus.APPROVED,
+          deletedAt: null,
+          category: { slug: 'oziq-ovqat' },
+          branches: { some: { districtId: 3, cityId: 7, deletedAt: null } },
+          name: { contains: 'osh', mode: 'insensitive' },
+        });
+      });
+
+      it('counts with the same filter it lists with, so pagination totals agree', async () => {
+        await service.findAll({ district: 3, city: 7 } as any);
+
+        expect(prisma.business.count).toHaveBeenCalledWith({ where: whereOf() });
+      });
+    });
   });
 
   describe('findOne', () => {
