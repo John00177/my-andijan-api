@@ -11,6 +11,7 @@ import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { ListEventsQueryDto } from './dto/list-events-query.dto';
 import { CreateEventDto } from './dto/create-event.dto';
 import { slugBase } from '../common/slug';
+import { incrementEventAttendeeCount } from '../common/counters';
 
 const EVENT_LIST_SELECT = {
   id: true,
@@ -26,6 +27,9 @@ const EVENT_LIST_SELECT = {
   price: true,
   currency: true,
   attendeeCount: true,
+  // Phase 16F.6: the sitemap's lastmod. Meaningful because RSVPs no longer
+  // move it (common/counters.ts) — only real edits of the event do.
+  updatedAt: true,
   business: { select: { id: true, slug: true, name: true, logoUrl: true } },
   district: { select: { id: true, slug: true, nameUz: true } },
   category: { select: { id: true, slug: true, nameUz: true, nameRu: true, nameEn: true } },
@@ -120,22 +124,20 @@ export class EventsService {
       }
     }
 
-    const [attendee] = await this.prisma.$transaction([
-      existing
-        ? this.prisma.eventAttendee.update({
+    return this.prisma.$transaction(async (tx) => {
+      const attendee = existing
+        ? await tx.eventAttendee.update({
             where: { id: existing.id },
             data: { status: AttendeeStatus.GOING },
           })
-        : this.prisma.eventAttendee.create({
+        : await tx.eventAttendee.create({
             data: { eventId: event.id, userId, status: AttendeeStatus.GOING },
-          }),
-      this.prisma.event.update({
-        where: { id: event.id },
-        data: { attendeeCount: { increment: 1 } },
-      }),
-    ]);
-
-    return attendee;
+          });
+      // Plain SQL increment (Phase 16F.6): an RSVP is not an edit of the
+      // event, so it must not move the event's updatedAt (sitemap lastmod).
+      await incrementEventAttendeeCount(tx, event.id);
+      return attendee;
+    });
   }
 
   async create(user: AuthenticatedUser, dto: CreateEventDto) {
