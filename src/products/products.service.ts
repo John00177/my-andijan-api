@@ -5,14 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { CreateMenuItemDto } from './dto/create-menu-item.dto';
 import { UpdateMenuItemDto } from './dto/update-menu-item.dto';
-
-function slugify(input: string): string {
-  return input
-    .toLowerCase()
-    .replace(/['’ʻʼ`]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
+import { slugBase } from '../common/slug';
 
 // ============================================================================
 // MENU  (GET/POST /businesses/:id/menu, PATCH/DELETE /menu/:id)
@@ -143,7 +136,7 @@ export class ProductsService {
 
 
   private async generateUniqueSlug(businessId: number, name: string): Promise<string> {
-    const base = slugify(name) || 'item';
+    const base = slugBase(name, 'item');
     let slug = base;
     let suffix = 1;
     while (await this.prisma.product.findUnique({ where: { businessId_slug: { businessId, slug } } })) {

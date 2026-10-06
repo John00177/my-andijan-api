@@ -10,6 +10,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { ListEventsQueryDto } from './dto/list-events-query.dto';
 import { CreateEventDto } from './dto/create-event.dto';
+import { slugBase } from '../common/slug';
 
 const EVENT_LIST_SELECT = {
   id: true,
@@ -198,12 +199,8 @@ export class EventsService {
   }
 
   private async generateUniqueSlug(title: string): Promise<string> {
-    const base =
-      title
-        .toLowerCase()
-        .replace(/['’ʻʼ`]/g, '')
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '') || 'event';
+    // Cyrillic transliterated, never empty, never all digits (Phase 16F.2).
+    const base = slugBase(title, 'event');
 
     let slug = base;
     let suffix = 1;

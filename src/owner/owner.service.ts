@@ -15,14 +15,7 @@ import { UpdateBranchDto } from './dto/update-branch.dto';
 import { UpdateMyEventDto } from './dto/update-my-event.dto';
 import { PaginationQueryDto } from './dto/pagination.dto';
 import { CreateClaimDto } from './dto/create-claim.dto';
-
-function slugify(input: string): string {
-  return input
-    .toLowerCase()
-    .replace(/['’ʻʼ`]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
+import { slugBase } from '../common/slug';
 
 function paginate(page: number, limit: number, total: number) {
   return { page, limit, total, totalPages: Math.ceil(total / limit) || 1 };
@@ -210,7 +203,8 @@ export class OwnerService {
   }
 
   private async generateUniqueBusinessSlug(name: string): Promise<string> {
-    const base = slugify(name) || 'business';
+    // Cyrillic transliterated, never empty, never all digits (Phase 16F.2).
+    const base = slugBase(name, 'business');
     let slug = base;
     let suffix = 1;
     while (await this.prisma.business.findUnique({ where: { slug } })) {
@@ -361,7 +355,7 @@ export class OwnerService {
   }
 
   private async generateUniqueBranchSlug(businessId: number, name: string): Promise<string> {
-    const base = slugify(name) || 'branch';
+    const base = slugBase(name, 'branch');
     let slug = base;
     let suffix = 1;
     while (await this.prisma.branch.findUnique({ where: { businessId_slug: { businessId, slug } } })) {

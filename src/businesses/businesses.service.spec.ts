@@ -83,6 +83,70 @@ describe('BusinessesService', () => {
       expect(prisma.business.findFirst.mock.calls[1][0].where).toMatchObject({ id: 4 });
     });
 
+    // Phase 16F.2: a numeric value is an ID first; only if no business has
+    // that ID is it tried as a slug (a legacy all-digit slug from before
+    // slugBase made them impossible).
+    describe('numeric values (id first, legacy numeric slug second)', () => {
+      const found = {
+        id: 12,
+        slug: '777',
+        businessType: { catalogEnabled: true, eventsEnabled: true },
+        products: [],
+        events: [],
+      };
+
+      beforeEach(() => {
+        prisma.review.findMany.mockResolvedValue([]);
+      });
+
+      it('resolves a matching ID with a single ID query', async () => {
+        prisma.business.findFirst.mockResolvedValueOnce({ ...found, id: 777, slug: 'soy' });
+
+        const result = await service.findOne('777');
+
+        expect(result.id).toBe(777);
+        expect(prisma.business.findFirst).toHaveBeenCalledTimes(1);
+        expect(prisma.business.findFirst.mock.calls[0][0].where).toMatchObject({ id: 777 });
+      });
+
+      it('falls back to the slug when no business has that ID', async () => {
+        prisma.business.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce(found);
+
+        const result = await service.findOne('777');
+
+        expect(result.id).toBe(12);
+        expect(prisma.business.findFirst).toHaveBeenCalledTimes(2);
+        expect(prisma.business.findFirst.mock.calls[1][0].where).toMatchObject({ slug: '777' });
+        expect(prisma.business.findFirst.mock.calls[1][0].where).not.toHaveProperty('id');
+      });
+
+      it('keeps the visibility rules on the slug fallback', async () => {
+        prisma.business.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce(found);
+
+        await service.findOne('777');
+
+        expect(prisma.business.findFirst.mock.calls[1][0].where).toMatchObject({
+          slug: '777',
+          status: BusinessStatus.APPROVED,
+          deletedAt: null,
+        });
+      });
+
+      it('answers 404 when neither the ID nor the slug matches', async () => {
+        prisma.business.findFirst.mockResolvedValue(null);
+
+        await expect(service.findOne('777')).rejects.toThrow(NotFoundException);
+        expect(prisma.business.findFirst).toHaveBeenCalledTimes(2);
+      });
+
+      it('does not double-query a non-numeric slug', async () => {
+        prisma.business.findFirst.mockResolvedValue(null);
+
+        await expect(service.findOne('soy-milliy-taomlar')).rejects.toThrow(NotFoundException);
+        expect(prisma.business.findFirst).toHaveBeenCalledTimes(1);
+      });
+    });
+
     it('hides products/events when the business type disables them', async () => {
       prisma.business.findFirst.mockResolvedValue({
         id: 5,
