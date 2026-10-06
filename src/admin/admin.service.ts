@@ -49,14 +49,10 @@ import {
   assertNotOwnReportMatter,
   assertNotOwnReviewMatter,
 } from '../authz/policies';
-
-function slugify(input: string): string {
-  return input
-    .toLowerCase()
-    .replace(/['’ʻʼ`]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
+// Shared since Phase 16F.2: transliterates Cyrillic category names instead of
+// deleting them. Categories are looked up by slug only, never by id, so the
+// all-digits rule in slugBase is not needed here.
+import { slugify } from '../common/slug';
 
 // Contact details (owner phone/email, reporter names) are shaped by the
 // `user.pii.read` capability (D-72, D-75): MODERATOR lacks it, ADMIN and

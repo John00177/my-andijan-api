@@ -193,13 +193,14 @@ export class BusinessesService {
     const asId = Number(idOrSlug);
     const isId = Number.isInteger(asId) && String(asId) === idOrSlug;
 
-    const business = await this.prisma.business.findFirst({
-      where: {
-        ...(isId ? { id: asId } : { slug: idOrSlug }),
-        status: BusinessStatus.APPROVED,
-        deletedAt: null,
-      },
-      include: {
+    const findVisible = (where: { id: number } | { slug: string }) =>
+      this.prisma.business.findFirst({
+        where: {
+          ...where,
+          status: BusinessStatus.APPROVED,
+          deletedAt: null,
+        },
+        include: {
         category: true,
         businessType: true,
         branches: {
@@ -221,7 +222,14 @@ export class BusinessesService {
           orderBy: { startAt: 'asc' },
         },
       },
-    });
+      });
+
+    // A numeric value is an ID first (the edit modal and admin links rely on
+    // that). Since Phase 16F.2 no new slug is all digits (slugBase), but one
+    // created earlier could be: only when no business has that ID is the
+    // value tried as a slug, so such a /business/<digits> URL still resolves.
+    let business = await findVisible(isId ? { id: asId } : { slug: idOrSlug });
+    if (!business && isId) business = await findVisible({ slug: idOrSlug });
 
     if (!business) {
       throw new NotFoundException(`Business "${idOrSlug}" not found`);
