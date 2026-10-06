@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { BusinessStatus, Prisma, ReviewStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { incrementBusinessViewCount } from '../common/counters';
 import { RecordViewDto } from './dto/record-view.dto';
 import { AnalyticsClickAction, RecordClickDto } from './dto/record-click.dto';
 import { RecordSearchDto } from './dto/record-search.dto';
@@ -75,8 +76,8 @@ export class AnalyticsService {
 
     const date = dateOnly(new Date());
 
-    await this.prisma.$transaction([
-      this.prisma.businessAnalytics.upsert({
+    await this.prisma.$transaction(async (tx) => {
+      await tx.businessAnalytics.upsert({
         where: { businessId_date: { businessId: dto.businessId, date } },
         update: {
           pageViews: { increment: 1 },
@@ -88,23 +89,22 @@ export class AnalyticsService {
           pageViews: 1,
           visitorCities: dto.cityId ? [dto.cityId] : [],
         },
-      }),
+      });
       // viewCount existed on Business already but had no writer anywhere in
       // the codebase — this is the first endpoint that actually records a
-      // view, so it's the natural place to finally maintain it.
-      this.prisma.business.update({
-        where: { id: dto.businessId },
-        data: { viewCount: { increment: 1 } },
-      }),
+      // view, so it's the natural place to finally maintain it. A plain SQL
+      // increment (Phase 16F.6): a page view is not an edit, so it must not
+      // move the business's updatedAt (sitemap lastmod).
+      await incrementBusinessViewCount(tx, dto.businessId);
       // Raw event stream for the platform command center.
-      this.prisma.activityLog.create({
+      await tx.activityLog.create({
         data: {
           actionType: 'BUSINESS_VIEWED',
           businessId: dto.businessId,
           metadata: dto.cityId ? { cityId: dto.cityId } : Prisma.JsonNull,
         },
-      }),
-    ]);
+      });
+    });
 
     return { success: true };
   }

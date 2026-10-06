@@ -27,6 +27,9 @@ const LIST_SELECT = {
   favoriteCount: true,
   isPromoted: true,
   isFeatured: true,
+  // Phase 16F.6: the sitemap's lastmod. Meaningful because page views and
+  // favourites no longer move it (common/counters.ts) — only real edits do.
+  updatedAt: true,
   category: {
     select: { id: true, slug: true, nameUz: true, nameRu: true, nameEn: true },
   },

@@ -1,6 +1,7 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { BusinessStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { changeBusinessFavoriteCount } from '../common/counters';
 import { CreateFavoriteDto } from './dto/create-favorite.dto';
 
 const FAVORITE_BUSINESS_SELECT = {
@@ -42,10 +43,9 @@ export class FavoritesService {
         const favorite = await tx.favorite.create({
           data: { userId, businessId: dto.businessId },
         });
-        await tx.business.update({
-          where: { id: dto.businessId },
-          data: { favoriteCount: { increment: 1 } },
-        });
+        // Plain SQL increment (Phase 16F.6): a favourite is not an edit of
+        // the listing, so it must not move the business's updatedAt.
+        await changeBusinessFavoriteCount(tx, dto.businessId, 1);
         return favorite;
       });
     } catch (error) {
@@ -64,13 +64,10 @@ export class FavoritesService {
       throw new NotFoundException('Favorite not found');
     }
 
-    await this.prisma.$transaction([
-      this.prisma.favorite.delete({ where: { id: favorite.id } }),
-      this.prisma.business.update({
-        where: { id: businessId },
-        data: { favoriteCount: { decrement: 1 } },
-      }),
-    ]);
+    await this.prisma.$transaction(async (tx) => {
+      await tx.favorite.delete({ where: { id: favorite.id } });
+      await changeBusinessFavoriteCount(tx, businessId, -1);
+    });
 
     return { success: true };
   }
