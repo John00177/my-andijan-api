@@ -692,8 +692,11 @@ model BranchPhoto {
 // Extracted out of Business. A business may be claimed, rejected, and
 // re-claimed — that history is an entity, not two columns.
 //
-// NOTE: "only one PENDING claim per business" cannot be expressed as a Prisma
-// unique constraint (needs a partial index) — enforce in the service layer.
+// NOTE: one PENDING claim per (business, claimant) is enforced by the partial
+// unique index business_claims_one_pending_per_claimant (Phase 16H migration;
+// Prisma cannot model a partial index, so it lives only in SQL). Several
+// PENDING claims from DIFFERENT claimants are allowed — they compete, and
+// approving one rejects the others in the service layer (approveClaim).
 // ============================================================================
 
 model BusinessClaim {
