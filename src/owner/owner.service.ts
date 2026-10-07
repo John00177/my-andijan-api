@@ -17,6 +17,8 @@ import { PaginationQueryDto } from './dto/pagination.dto';
 import { CreateClaimDto } from './dto/create-claim.dto';
 import { slugBase } from '../common/slug';
 
+const DUPLICATE_PENDING_CLAIM = 'You already have a pending claim for this business';
+
 function paginate(page: number, limit: number, total: number) {
   return { page, limit, total, totalPages: Math.ceil(total / limit) || 1 };
 }
@@ -519,7 +521,7 @@ export class OwnerService {
       where: { businessId: dto.businessId, claimantId: user.id, status: ClaimStatus.PENDING },
     });
     if (existingPending) {
-      throw new ConflictException('You already have a pending claim for this business');
+      throw new ConflictException(DUPLICATE_PENDING_CLAIM);
     }
 
     // Filing a claim is audited like the staff decision on it (Phase 16C.1),
@@ -528,33 +530,66 @@ export class OwnerService {
     // claimant's evidence and contact details stay on the claim itself
     // (readable by the claimant and `claim.review` holders) rather than being
     // copied into the broader audit log.
-    return this.prisma.$transaction(async (tx) => {
-      const claim = await tx.businessClaim.create({
-        data: {
-          businessId: dto.businessId,
-          claimantId: user.id,
-          evidence: dto.evidence,
-          contactPhone: dto.contactPhone,
-          contactNote: dto.contactNote,
-        },
-        include: {
-          business: { select: { id: true, slug: true, name: true } },
-        },
-      });
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        await this.lockClaimableBusiness(tx, dto.businessId);
 
-      await tx.auditLog.create({
-        data: {
-          ...auditRequestFields(),
-          actorId: user.id,
-          action: AuditAction.CREATE,
-          entityType: 'BusinessClaim',
-          entityId: claim.id,
-          before: {} as Prisma.InputJsonValue,
-          after: { businessId: claim.businessId, status: claim.status } as Prisma.InputJsonValue,
-        },
-      });
+        const claim = await tx.businessClaim.create({
+          data: {
+            businessId: dto.businessId,
+            claimantId: user.id,
+            evidence: dto.evidence,
+            contactPhone: dto.contactPhone,
+            contactNote: dto.contactNote,
+          },
+          include: {
+            business: { select: { id: true, slug: true, name: true } },
+          },
+        });
 
-      return claim;
-    });
+        await tx.auditLog.create({
+          data: {
+            ...auditRequestFields(),
+            actorId: user.id,
+            action: AuditAction.CREATE,
+            entityType: 'BusinessClaim',
+            entityId: claim.id,
+            before: {} as Prisma.InputJsonValue,
+            after: { businessId: claim.businessId, status: claim.status } as Prisma.InputJsonValue,
+          },
+        });
+
+        return claim;
+      });
+    } catch (error) {
+      // Phase 16H: the reads above are friendly pre-checks, not the guarantee.
+      // A concurrent duplicate (double submit, retried request) passes them
+      // too; the partial unique index business_claims_one_pending_per_claimant
+      // refuses its INSERT, and that is reported as the same 409.
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException(DUPLICATE_PENDING_CLAIM);
+      }
+      throw error;
+    }
+  }
+
+  // Phase 16H: re-checks "approved, unowned, not deleted" under a shared lock
+  // on the business row, inside the claim's transaction. AdminService.
+  // approveClaim assigns the owner with an UPDATE of that same row, so the two
+  // serialize: if the approval commits first, the locked re-read sees the new
+  // owner and this claim is refused; if this claim holds the lock first, the
+  // approval waits, and its "reject every other pending claim" step (a later
+  // statement, so a fresh snapshot) then finds and closes this one. Either way
+  // no PENDING claim is left behind on a listing that already has an owner.
+  // FOR SHARE, not FOR UPDATE: concurrent claims on one listing don't block
+  // each other — only ownership changes wait.
+  private async lockClaimableBusiness(tx: Prisma.TransactionClient, businessId: number) {
+    const claimable = await tx.$queryRaw<Array<{ id: number }>>`
+      SELECT id FROM businesses
+      WHERE id = ${businessId} AND owner_id IS NULL AND status = 'APPROVED' AND deleted_at IS NULL
+      FOR SHARE`;
+    if (claimable.length === 0) {
+      throw new ConflictException('This business is already claimed or no longer open to claims');
+    }
   }
 }
