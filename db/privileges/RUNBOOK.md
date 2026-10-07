@@ -63,7 +63,13 @@ STOP, change nothing further, and report to the owner when:
 7. any verification row (V01–V12) is `FAIL`;
 8. after Phase D, the API is unhealthy or logs `permission denied`;
 9. any change outside Gate 2 scope appears necessary: SIG tables, RLS, staff credentials or sessions, STAFF code;
-10. the next step has not been **explicitly authorized** by the owner.
+10. the next step has not been **explicitly authorized** by the owner;
+11. the R-E4 write pause (§8) cannot be established or verified, or the resume does not return to the recorded deployment:
+    - P4 is not 0 rows;
+    - an API deployment or build is present or appears;
+    - the health check still answers;
+    - after the Remove, the recorded deployment is not `REMOVED`, is missing from the deployment history, or has no Rollback action;
+    - after the Rollback, the API is not on the recorded deployment, or not healthy.
 
 ## 5. Entry criteria (all before Step 2)
 
@@ -155,7 +161,8 @@ The procedure was proven on 2026-10-05 against a disposable PostgreSQL 18 cluste
 - Phase A, then V01–V12 `PASS`, then rollback, all worked through it.
 
 ### Step 0 — Open the window (owner)
-Record the start time, operator and runbook commit SHA in the gate-02 `SESSION_LOG.md`.
+Record the start time, operator and runbook commit SHA in the gate-02 `SESSION_LOG.md`. A window that includes R-E4
+starts with §8 W0: record the live API deployment and declare the merge/deploy freeze.
 
 ### Step 1 — Read-only preflight: `00_preflight_readonly.sql` (owner, or Claude when authorized)
 **Expected** (the 2026-10-05 pre-check; anything else is a STOP):
@@ -181,7 +188,8 @@ Record the start time, operator and runbook commit SHA in the gate-02 `SESSION_L
 - P19: `log_statement = none`, `password_encryption = scram-sha-256`.
 
 ### Step 2 — R-E4: fresh dump + verified isolated restore (owner) — see §8
-Phase A may start only when §8 has completed successfully **inside this window**.
+R-E4 runs under the §8 write pause (W0–W9). Phase A may start only when §8 has completed successfully **inside this
+window**.
 
 ### Step 3 — Phase A: `10_phase_a_boundary.sql` (owner, write)
 Expected output: `BEGIN` … `COMMIT`, no error.
@@ -270,15 +278,100 @@ disagree (`test/db/r-e4.db-spec.ts`).
 - the agreed window (E5), with the Step 1 preflight passed inside it;
 - the operator;
 - `R_E4_DIR` on encrypted storage, with enough free space (the last volume backup was about 119 MB);
-- PostgreSQL 18 binaries in `PG18_BIN` (default `D:/PostgreSQL/bin`; PATH is not used);
+- PostgreSQL **18.6** binaries in `PG18_BIN`: the prepared installation `D:/PostgreSQL-18.6/pgsql/bin` (owner decision, 2026-10-06; PATH is not used).
+  - **Always export `PG18_BIN` explicitly** (step 1). `restore-check.sh`'s built-in fallback, `D:/PostgreSQL/bin`, is not the approved installation and must not be relied on.
+  - `restore-check.sh` itself checks only the major version. So the operator checks the minor: `"$PG18_BIN/postgres" --version` must print 18.6, otherwise STOP;
 - a free private port in `R_E4_PORT` (default 55499);
 - the `railway` CLI logged in with its registered SSH key;
 - the merged commit `REV`;
-- the retention decision.
+- the retention decision;
+- the merge/deploy freeze and the write pause below (owner decision, 2026-10-06).
+
+### Write pause and resume (owner decision, 2026-10-06)
+
+R-E4 runs with **application writes paused**. The dump and the production counts are then taken while nothing can
+write, so the restore can be compared exactly, and a failed check can be repeated against the same unchanged data.
+
+**Why stopping the API is enough.** Verified 2026-10-06, read-only, against the running deployment and Railway's
+production environment:
+- The API service `myandijan-api` is the **only application that writes** to the database. It runs **one replica**, in one region.
+- There are **no workers, cron jobs, queues or webhooks**:
+  - no Railway service besides `Postgres` and the API;
+  - no scheduler or queue package;
+  - no timers in the code.
+- The frontend only calls the API. Image uploads go to Supabase storage, not to this database.
+- Writes are not limited to POST, PUT, PATCH and DELETE:
+  - **`GET /me/health-score` writes**: it computes and stores a missing score;
+  - a failed password-reset SMS is recorded after the response has been sent.
+
+  So the pause must stop the whole API; blocking the write methods would not be enough.
+- **Stopping the API therefore blocks every application-originated write.** It also stops reads: the API is unavailable for the whole pause.
+- P4 of `00_preflight_readonly.sql` excludes the operator's own database session (`pid <> pg_backend_pid()`). P4 with **0 rows** therefore means no other client is connected.
+- **Production can be behind `main`.** On 2026-10-06 it was: the running deployment predated several merged PRs.
+  - This is intentionally **not** corrected during R-E4: the resume returns to the exact deployment recorded at W0.
+  - Deploying `main` is a separate decision, authorized separately.
+
+**Recorded production deployment.** At W0 the operator reads these values from Railway and records them in the gate-02
+`SESSION_LOG.md`. W7 and W8 use exactly the recorded values. They are never written into this file.
+
+| Item | Value |
+|---|---|
+| Service | `myandijan-api` (production), 1 replica |
+| Deployment | `<RECORDED_DEPLOYMENT_ID>` |
+| Commit | `<RECORDED_COMMIT_SHA>` |
+| Health check | `GET /categories` on `https://myandijan-api-production.up.railway.app` |
+
+**Never during the window:**
+- a Redeploy, a deployment of `main`, a replacement deployment, or any merge to `main`;
+- a database configuration change, such as a read-only setting;
+- terminating or cancelling database sessions;
+- a migration, a privilege change, a variable change, or an emergency code change.
+
+If sessions remain after the pause, STOP. Do not terminate them.
+
+**Window sequence.** The owner authorizes each production action; Claude runs the read-only checks.
+
+| Step | Who | Action | Pass condition |
+|---|---|---|---|
+| W0 | owner | Record the live API deployment as `<RECORDED_DEPLOYMENT_ID>` / commit `<RECORDED_COMMIT_SHA>` in `SESSION_LOG.md`. Declare the **merge/deploy freeze**: no merge to `main` and no deployment of `main` for the whole window | Exactly one active `myandijan-api` deployment, `SUCCESS`, 1 replica; its ID and commit are recorded |
+| W1 | Claude (read-only) | Preflight: `00_preflight_readonly.sql`, then `30_rowcounts_readonly.sql` with the step 4 `-At` invocation, both through the §6 transport | The §6 Step 1 expectations hold; P4 shows the API's connections, all `postgres` (12 idle on 2026-10-06); the counts normalize |
+| W2 | owner | **Pause:** in Railway → `myandijan-api` → Deployments, on the active deployment, ⋮ → **Remove** | — |
+| W3 | Claude (read-only) + owner | **Verify the pause:** run `00` again; check Railway; call the health check | P4 returns **0 rows**, and everything else is unchanged from W1; Railway shows **no** active, building or deploying `myandijan-api` deployment; the recorded deployment `<RECORDED_DEPLOYMENT_ID>` is in state **`REMOVED`**, is **still present in the deployment history**, and **still offers ⋮ → Rollback**; the health check does **not** answer 200. Otherwise **STOP R-E4**: do not continue to W4, and do **not** proceed automatically to W7; resume (W7, W8) only on the owner's **explicit confirmation** (failure handling below) |
+| W4 | owner + Claude | R-E4 steps 1–4: set up, pin `remote-dump.sh`, dump, production counts | Each step's own checks. Otherwise **STOP R-E4**: a partial or failed dump is not used; do **not** proceed automatically to W7 and do **not** roll back automatically; resume (W7, W8) only on the owner's **explicit confirmation** (failure handling below) |
+| W5 | Claude (read-only) + owner | **Re-verify the pause immediately:** run `00` again; check Railway | P4 still returns **0 rows**, and **no** deployment or build has appeared. Otherwise **STOP R-E4**: the dump is not used; do **not** proceed automatically to W7 and do **not** roll back automatically; resume (W7, W8) only on the owner's **explicit confirmation** (failure handling below) |
+| W6 | owner + Claude, local | R-E4 steps 5–6: unframe and decode; `"$PG18_BIN/postgres" --version`; `restore-check.sh` | `unframe-dump.sh` succeeds; the version is 18.6; `restore-check.sh` exits **0**. Otherwise **STOP R-E4**: do **not** proceed automatically to W7 and do **not** roll back automatically; resume (W7, W8) only on the owner's **explicit confirmation** (failure handling below) |
+| W7 | owner | **Resume**, only on the owner's **explicit authorization:** in Railway → `myandijan-api` → Deployments, select the recorded removed deployment `<RECORDED_DEPLOYMENT_ID>` and use ⋮ → **Rollback** on that deployment. **Never Redeploy** (it rebuilds), **never deploy `main`**, and **never substitute another deployment** | Verify the resulting active deployment: it comes from the Rollback of `<RECORDED_DEPLOYMENT_ID>`, not from a new build, and runs commit `<RECORDED_COMMIT_SHA>` (checked in full at W8) |
+| W8 | Claude (read-only) + owner | **Verify the resume:** check Railway; call the health check; run `00` again | The active deployment is `SUCCESS` on commit `<RECORDED_COMMIT_SHA>`; the health check answers **200**; P4 shows `postgres` connections again (at least one; the pool grows with traffic) and no drift from W1. Otherwise apply the failure handling below |
+| W9 | owner | Lift the merge/deploy freeze, and record the end time (step 7) | — |
+
+**Failure handling:**
+- **A STOP before W2:** nothing was paused, so no resume is needed.
+- **A STOP at W3:** R-E4 stops and is not met. Do not continue to W4, and do **not** proceed automatically to W7.
+  Report to the owner; W7 and W8 run only on the owner's **explicit confirmation**. If the recorded deployment is
+  not `REMOVED`, is missing from the deployment history, or has no Rollback action, also: do not deploy `main`, do
+  not create a replacement deployment, and do not improvise a recovery path. The hard stop still holds: no
+  production remediation, SQL privilege change, credential or variable change, migration or emergency code change.
+- **A STOP at W5** (database sessions, or an API deployment that is active, building or deploying, reappeared after
+  the dump): R-E4 stops and is not met; the dump is not used. Do **not** proceed automatically to W7 and do **not**
+  roll back automatically. Report to the owner; W7 and W8 run only on the owner's **explicit confirmation**. The
+  hard stop still holds: no production remediation, SQL privilege change, credential or variable change, migration,
+  emergency code change or replacement deployment.
+- **A STOP at W4** (set-up, pin, dump or production counts failed): R-E4 stops and is not met; a partial or failed
+  dump is not used. Do **not** proceed automatically to W7 and do **not** roll back automatically. Report the
+  failure to the owner; W7 and W8 run only on the owner's **explicit confirmation**. The hard stop still holds: no
+  production remediation, SQL privilege change, credential or variable change, migration, emergency code change or
+  replacement deployment.
+- **A STOP at W6** (unframe, version check or restore check failed): R-E4 stops and is not met. Do **not** proceed
+  automatically to W7 and do **not** roll back automatically. Report the failure to the owner; W7 and W8 run only on
+  the owner's **explicit confirmation**. The hard stop still holds: no production remediation, SQL privilege change,
+  credential or variable change, migration, emergency code change or replacement deployment.
+- **W7 itself** always runs only on the owner's **explicit authorization**.
+- **The Rollback (W7) fails, or W8 fails:** roll back to the same deployment again.
+- **That also fails:** the API stays down. STOP and report to the owner. Still no Redeploy, no deployment of `main`, no replacement deployment, and no production remediation, migration, SQL privilege change or emergency code change in this window.
 
 1. **Set up** (Git Bash, at the repository root). Set `R_E4_ENCRYPTED_STORAGE_CONFIRMED=yes` only after confirming the folder is encrypted; `restore-check.sh` refuses without it:
    ```bash
-   export R_E4_DIR=<encrypted folder> R_E4_ENCRYPTED_STORAGE_CONFIRMED=yes PG18_BIN=D:/PostgreSQL/bin; REV=<merged commit SHA>; STAMP=$(date +%Y%m%d-%H%M); NONCE=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+   export R_E4_DIR=<encrypted folder> R_E4_ENCRYPTED_STORAGE_CONFIRMED=yes PG18_BIN=D:/PostgreSQL-18.6/pgsql/bin; REV=<merged commit SHA>; STAMP=$(date +%Y%m%d-%H%M); NONCE=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
    ```
 2. **Pin the production command.** Use the exact committed bytes and the fingerprint from the table above. Anything but `MATCH` is a STOP:
    ```bash
@@ -352,7 +445,13 @@ disagree (`test/db/r-e4.db-spec.ts`).
    | 1 | anything else: STOP |
 
    `_prisma_migrations` and the table set must always match exactly.
-7. **Record** in the gate log: times, dump size and SHA-256, the restore-check exit status and table count, and `cleanup done`. R-E4 is then met, and Phase A may be authorized. Keep the encrypted dump per the retention decision. Delete `remote-dump.sh`, `*.framed` and `*.raw` from `R_E4_DIR` when no longer needed.
+7. **Record** in the gate log:
+   - times;
+   - dump size and SHA-256;
+   - the restore-check exit status and table count, and `cleanup done`;
+   - the W0–W9 results: the deployment before and after, P4 at W1, W3, W5 and W8, and the health-check results.
+
+   R-E4 is then met, and Phase A may be authorized. Keep the encrypted dump per the retention decision. Delete `remote-dump.sh`, `*.framed` and `*.raw` from `R_E4_DIR` when no longer needed.
 
 Any non-zero exit in steps 2–6 is a STOP (stop conditions 1 and 4).
 
@@ -433,6 +532,19 @@ Verified 2026-10-05 against this repository (Prisma 5.22, PostgreSQL 18):
 
 `npm run test:db:runtime` re-runs the application suites with the application client connected as `runtime_app_public`
 after Phase A (G2-C2). It fails the run if the client is not that role.
+
+`test/db/runbook-write-pause.db-spec.ts` (part of `test:db`) checks the §8 write pause:
+- the W0–W9 order;
+- the resume rolls back to the deployment recorded at W0, never by Redeploy, never to `main`, never to a substitute;
+- W3 verifies that the removed deployment stays in the history and rollback-eligible;
+- a W3, W4, W5 or W6 failure stops R-E4 without an automatic resume or rollback, and W7 runs only on the owner's
+  explicit authorization;
+- no production deployment ID or commit SHA is hard-coded in the procedure;
+- the restore uses the approved PostgreSQL 18.6 binaries, set explicitly and checked by version;
+- the window runs only `00` and `30`;
+- it contains no database-configuration, session-termination or deployment command;
+- P4 excludes the operator's own session;
+- the production counts use the §6 read-only invocation plus `-At`.
 
 `test/db/runbook-transport.db-spec.ts` (part of `test:db`) checks the §6 transport (F-6). The fingerprint table must
 list every SQL file in this directory with its exact SHA-256 (committed LF bytes), and every file's gzip + base64
