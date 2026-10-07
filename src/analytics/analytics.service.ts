@@ -6,6 +6,7 @@ import { RecordViewDto } from './dto/record-view.dto';
 import { AnalyticsClickAction, RecordClickDto } from './dto/record-click.dto';
 import { RecordSearchDto } from './dto/record-search.dto';
 import { TrafficPeriod, TrafficQueryDto } from './dto/traffic-query.dto';
+import { AnalyticsGate } from './analytics-gate';
 
 function dateOnly(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
@@ -60,12 +61,30 @@ const CLICK_ACTIVITY_TYPE: Record<AnalyticsClickAction, string> = {
   [AnalyticsClickAction.WEBSITE]: 'WEBSITE_CLICKED',
 };
 
+// Phase 16G: BusinessAnalytics keeps one row per business per day, and two of
+// its columns are arrays that grew by one element per event with no bound — a
+// burst of traffic (or a script) could grow a single row without limit. Past
+// these sizes a day's sample is plenty for the percentages and "top terms"
+// the owner sees, so further elements are simply not appended; the counters
+// (pageViews, clicks) are unaffected.
+export const MAX_VISITOR_CITIES_PER_DAY = 1000;
+export const MAX_SEARCH_QUERIES_PER_DAY = 200;
+
 @Injectable()
 export class AnalyticsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Optional so a bare `new AnalyticsService(prisma)` (unit tests) still works.
+    private readonly gate: AnalyticsGate = new AnalyticsGate(),
+  ) {}
 
   // ============================================================================
   // COLLECTION (public, anonymous)
+  //
+  // Each collector validates first (an unknown business is still a 404), then
+  // asks AnalyticsGate whether to RECORD the event — a repeat from the same
+  // client inside its window, or an address over its budget, is answered with
+  // the same { success: true } and writes nothing.
   // ============================================================================
 
   async recordView(dto: RecordViewDto) {
@@ -73,23 +92,25 @@ export class AnalyticsService {
     if (dto.cityId) {
       await this.assertCityExists(dto.cityId);
     }
+    if (!this.gate.admit('view', String(dto.businessId))) {
+      return { success: true };
+    }
 
     const date = dateOnly(new Date());
 
     await this.prisma.$transaction(async (tx) => {
       await tx.businessAnalytics.upsert({
         where: { businessId_date: { businessId: dto.businessId, date } },
-        update: {
-          pageViews: { increment: 1 },
-          ...(dto.cityId ? { visitorCities: { push: dto.cityId } } : {}),
-        },
-        create: {
-          businessId: dto.businessId,
-          date,
-          pageViews: 1,
-          visitorCities: dto.cityId ? [dto.cityId] : [],
-        },
+        update: { pageViews: { increment: 1 } },
+        create: { businessId: dto.businessId, date, pageViews: 1, visitorCities: [] },
       });
+      if (dto.cityId) {
+        await tx.$executeRaw(Prisma.sql`
+          UPDATE business_analytics
+          SET visitor_cities = array_append(visitor_cities, ${dto.cityId}::int)
+          WHERE business_id = ${dto.businessId} AND date = ${isoDate(date)}::date
+            AND cardinality(visitor_cities) < ${MAX_VISITOR_CITIES_PER_DAY}`);
+      }
       // viewCount existed on Business already but had no writer anywhere in
       // the codebase — this is the first endpoint that actually records a
       // view, so it's the natural place to finally maintain it. A plain SQL
@@ -111,6 +132,9 @@ export class AnalyticsService {
 
   async recordClick(dto: RecordClickDto) {
     await this.getVisibleBusiness(dto.businessId);
+    if (!this.gate.admit('click', `${dto.businessId}:${dto.action}`)) {
+      return { success: true };
+    }
     const date = dateOnly(new Date());
     const field = CLICK_FIELD[dto.action];
 
@@ -129,42 +153,55 @@ export class AnalyticsService {
   }
 
   async recordSearch(dto: RecordSearchDto) {
-    if (dto.businessId) {
-      await this.getVisibleBusiness(dto.businessId);
+    const { businessId } = dto;
+    if (businessId) {
+      await this.getVisibleBusiness(businessId);
+    }
+    // The same query with the same filters, case- and space-insensitively.
+    const searchKey = [businessId, dto.categoryId, dto.districtId, dto.cityId, dto.query.trim().toLowerCase()]
+      .map((part) => part ?? '')
+      .join(':');
+    if (!this.gate.admit('search', searchKey)) {
+      return { success: true };
     }
 
-    // Canonical search log (SearchQueryLog is deprecated — see schema.prisma).
-    await this.prisma.$transaction([
-      this.prisma.searchAnalytics.create({
+    await this.prisma.$transaction(async (tx) => {
+      // Canonical search log (SearchQueryLog is deprecated — see schema.prisma).
+      await tx.searchAnalytics.create({
         data: {
           query: dto.query,
-          businessId: dto.businessId,
+          businessId,
           categoryId: dto.categoryId,
           districtId: dto.districtId,
           cityId: dto.cityId,
           resultCount: dto.resultCount,
         },
-      }),
-      this.prisma.activityLog.create({
+      });
+      await tx.activityLog.create({
         data: {
           actionType: 'SEARCH_PERFORMED',
-          businessId: dto.businessId,
+          businessId,
           metadata: { query: dto.query, resultCount: dto.resultCount },
         },
-      }),
-    ]);
-
-    // Only attributed searches (businessId given) feed the per-business
-    // "top search terms" field — a bare platform-wide search isn't about any
-    // one business.
-    if (dto.businessId) {
-      const date = dateOnly(new Date());
-      await this.prisma.businessAnalytics.upsert({
-        where: { businessId_date: { businessId: dto.businessId, date } },
-        update: { searchQueries: { push: dto.query } },
-        create: { businessId: dto.businessId, date, searchQueries: [dto.query] },
       });
-    }
+
+      // Only attributed searches (businessId given) feed the per-business
+      // "top search terms" field — a bare platform-wide search isn't about
+      // any one business.
+      if (businessId) {
+        const date = dateOnly(new Date());
+        await tx.businessAnalytics.upsert({
+          where: { businessId_date: { businessId, date } },
+          update: {},
+          create: { businessId, date, searchQueries: [] },
+        });
+        await tx.$executeRaw(Prisma.sql`
+          UPDATE business_analytics
+          SET search_queries = array_append(search_queries, ${dto.query})
+          WHERE business_id = ${businessId} AND date = ${isoDate(date)}::date
+            AND cardinality(search_queries) < ${MAX_SEARCH_QUERIES_PER_DAY}`);
+      }
+    });
 
     return { success: true };
   }
