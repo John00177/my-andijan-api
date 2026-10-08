@@ -20,3 +20,21 @@ describe('OwnerController.createClaim', () => {
     expect(result).toEqual({ id: 1 });
   });
 });
+
+describe('OwnerController.resubmitMyBusiness', () => {
+  it('delegates to OwnerService.resubmitMyBusiness with the current user id and the listing id', async () => {
+    const ownerService = { resubmitMyBusiness: jest.fn().mockResolvedValue({ id: 5, status: 'PENDING' }) };
+    const moduleRef = await Test.createTestingModule({
+      controllers: [OwnerController],
+      providers: [{ provide: OwnerService, useValue: ownerService }],
+    }).compile();
+
+    const controller = moduleRef.get(OwnerController);
+    const user = { id: 7, phone: '+998901234567', role: 'BUSINESS_OWNER' } as any;
+
+    const result = await controller.resubmitMyBusiness(5, user);
+
+    expect(ownerService.resubmitMyBusiness).toHaveBeenCalledWith(7, 5);
+    expect(result).toEqual({ id: 5, status: 'PENDING' });
+  });
+});
