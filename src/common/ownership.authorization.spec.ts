@@ -8,6 +8,7 @@ import { ReviewsController } from '../reviews/reviews.controller';
 import { ReviewsService } from '../reviews/reviews.service';
 import { AdminService } from '../admin/admin.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { OwnerController } from '../owner/owner.controller';
 import { OwnerService } from '../owner/owner.service';
 import { HealthScoreService } from '../health-score/health-score.service';
 import { decide, ruleOf } from '../authz/decide';
@@ -38,6 +39,7 @@ describe('Owner routes require business.manage_own (ownership checked in the ser
     ['POST /events', EventsController, EventsController.prototype.create],
     ['POST /reviews/:id/reply', ReviewsController, ReviewsController.prototype.reply],
     ['PATCH /reviews/:id/reply', ReviewsController, ReviewsController.prototype.replyPatch],
+    ['POST /me/businesses/:id/resubmit', OwnerController, OwnerController.prototype.resubmitMyBusiness],
   ];
 
   it.each(routes)('%s requires exactly business.manage_own', (_r, controller, handler) => {

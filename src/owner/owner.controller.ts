@@ -56,6 +56,13 @@ export class OwnerController {
     return this.ownerService.updateMyBusiness(user.id, id, dto);
   }
 
+  // Phase 16I: REJECTED -> PENDING, after the owner has fixed the listing.
+  @RequireCapability('business.manage_own')
+  @Post('businesses/:id/resubmit')
+  resubmitMyBusiness(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: AuthenticatedUser) {
+    return this.ownerService.resubmitMyBusiness(user.id, id);
+  }
+
   @RequireCapability('business.manage_own')
   @Post('businesses/:id/branches')
   createBranch(
