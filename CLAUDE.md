@@ -13,9 +13,11 @@ Claude Code instructions for this repository. **Read [`AGENTS.md`](AGENTS.md) fi
 
 ## This repository
 
+- **Home path: `D:\My-Andijan-Work` only** — `D:\My-Andijan-Work\myandijan-frontend` and `D:\My-Andijan-Work\my-andijan-api`. Do not work in other clones (Desktop, `D:\My-Andijan`, Temp worktrees); `D:\My-Andijan-SAFE` and the SIG gate record are read-only references.
 - Commands: `docker compose up -d` then `npm run start:dev`; `npm run build`; `npm test` (unit). `npm run lint` / `format` are **broken** (ESLint/Prettier not installed).
 - `npm run test:db` and `npm run test:db:runtime` need `TEST_DATABASE_URL` pointing at a **disposable local** database whose name contains `test`. They truncate tables and create cluster-wide roles — never point them at anything shared or remote.
-- **`db/privileges/`** is the reviewed SIG Gate 2 production runbook and SQL. Executing any of it against production requires the owner's explicit authorization. Every new migration that creates a table the API uses must `GRANT` it to `runtime_app_public` (`RUNBOOK.md` §10).
+- **`db/privileges/`** is the reviewed SIG Gate 2 production runbook and SQL. Executing any of it against production requires the owner's explicit authorization. Once Gate 2 resumes and Phase A has run, every new migration that creates a table the API uses must `GRANT` it to `runtime_app_public` (`RUNBOOK.md` §10).
+- **SIG Gate 2 is paused (owner, 2026-10-10, D-80): no `GRANT` to `runtime_app_public`** — not in a migration, a script or manual SQL — until the owner resumes Gate 2 and Phase A has run (`db/privileges/RUNBOOK.md` §10).
 - **Migrations:** `npx prisma migrate dev` locally only. Never run `migrate deploy`, `db push` or `migrate reset` against a non-local database. Railway runs `prisma migrate deploy` pre-deploy (`railway.json`), so migrations must be backward-compatible.
 - Authorization is capability-based, deny by default (`src/authz/`). Every route needs `@Public` / `@Authenticated` / `@RequireCapability`, or CI fails.
 - Windows: use `npm.cmd` / `npx.cmd`; PowerShell 5.1 has no `&&`.

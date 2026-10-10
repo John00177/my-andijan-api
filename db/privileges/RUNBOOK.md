@@ -494,6 +494,8 @@ Verified 2026-10-05 against this repository (Prisma 5.22, PostgreSQL 18):
 
 ## 10. Rules for every later migration (RB-D1, RB-D6)
 
+> **Gate 2 paused (owner decision, 2026-10-10; frontend `DECISIONS.md` D-80).** Phase A was never executed; production has no Gate 2 roles. **While Gate 2 is paused: no `GRANT` to `runtime_app_public`** — not in a migration, a script or manual SQL. The grant rules below take effect only after the owner resumes Gate 2 and Phase A has run.
+
 - A migration that creates a table the API uses must grant it explicitly, in the same `migration.sql`:
   ```sql
   GRANT SELECT, INSERT, UPDATE, DELETE ON "new_table" TO runtime_app_public;
