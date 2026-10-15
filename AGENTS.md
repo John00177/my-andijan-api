@@ -15,7 +15,7 @@ Operating rules for every AI agent (Claude, ChatGPT/Codex, others) in this repos
 
 - **Working memory** = this session. **Canonical memory** = files in Git. Nothing is known to the project until it is committed.
 - **Read before unfamiliar work:** `myandijan-frontend/docs/my-andijan/CURRENT_STATE.md` (top section), then only the domain document the task needs (`myandijan-frontend/docs/my-andijan/intelligence/PROJECT_MEMORY.md`). Do not reread everything every prompt.
-- **Update after a major session** (PR merged/opened, phase change, decision, production change, new blocker): `CURRENT_STATE.md` top section, `SESSION_CONTEXT.md`, `DECISIONS.md` if decided — per `MEMORY_CONTRACT.md` §4. Not for trivial work.
+- **Memory-impact check after every material change** — implementation, architecture, security, database, API, product, phase or deployment state, a decision, a new blocker. Nothing syncs GitHub into memory automatically, so before declaring the work done, reconcile only the affected docs (`CURRENT_STATE.md` top section, `SESSION_CONTEXT.md`, and `DECISIONS.md` / `TODO.md` / `ROADMAP.md` / domain docs as applicable) with PR/SHA/CI/deployment evidence — per `MEMORY_CONTRACT.md` §4. Backend changes get a follow-up `docs/` PR in `myandijan-frontend`. Not for trivial, read-only or no-change work.
 
 ## Git
 
@@ -35,4 +35,4 @@ Never read, print, copy, commit or store secrets, `.env` contents, tokens or cre
 
 ## Reporting
 
-Report: what changed (files, branch, PR, SHA) · verification run and results · merged/deployed state with evidence or "not deployed"/"UNKNOWN" · blockers · decisions needed. Prefer UNKNOWN to a guess.
+Report: what changed (files, branch, PR, SHA) · verification run and results · merged/deployed state with evidence or "not deployed"/"UNKNOWN" · blockers · decisions needed · `memory impact: updated` + files, or `memory impact: none` + why the change is not material. Prefer UNKNOWN to a guess.
