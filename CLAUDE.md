@@ -17,6 +17,7 @@ Claude Code instructions for this repository. **Read [`AGENTS.md`](AGENTS.md) fi
 - `npm run test:db` and `npm run test:db:runtime` need `TEST_DATABASE_URL` pointing at a **disposable local** database whose name contains `test`. They truncate tables and create cluster-wide roles — never point them at anything shared or remote.
 - **`db/privileges/`** is the reviewed SIG Gate 2 production runbook and SQL. Executing any of it against production requires the owner's explicit authorization. Every new migration that creates a table the API uses must `GRANT` it to `runtime_app_public` (`RUNBOOK.md` §10).
 - **Migrations:** `npx prisma migrate dev` locally only. Never run `migrate deploy`, `db push` or `migrate reset` against a non-local database. Railway runs `prisma migrate deploy` pre-deploy (`railway.json`), so migrations must be backward-compatible.
+- **`MIGRATION_DATABASE_URL`** is the schema's `directUrl` (SIG Gate 2, Phase C). `prisma migrate deploy`, and so Railway's pre-deploy command, fails with P1012 without it; `prisma generate` and the running API do not need it. In production it connects as `migration_owner`; locally it may equal `DATABASE_URL`. The test harness sets it itself.
 - Authorization is capability-based, deny by default (`src/authz/`). Every route needs `@Public` / `@Authenticated` / `@RequireCapability`, or CI fails.
 - Windows: use `npm.cmd` / `npx.cmd`; PowerShell 5.1 has no `&&`.
 

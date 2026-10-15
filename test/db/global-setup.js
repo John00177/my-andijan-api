@@ -14,7 +14,11 @@ module.exports = async () => {
     throw new Error(`Refusing to migrate: host "${url.hostname}", database "${database}" is not a local test database.`);
   }
 
-  // DATABASE_URL is set explicitly for the child, so the Prisma CLI can never
-  // pick up a different database from a .env file.
-  execSync('npx prisma migrate deploy', { env: { ...process.env, DATABASE_URL: raw }, stdio: ['ignore', 'ignore', 'inherit'] });
+  // DATABASE_URL and MIGRATION_DATABASE_URL (the schema's directUrl, which
+  // migrations use) are set explicitly for the child, so the Prisma CLI can
+  // never pick up a different database from a .env file.
+  execSync('npx prisma migrate deploy', {
+    env: { ...process.env, DATABASE_URL: raw, MIGRATION_DATABASE_URL: raw },
+    stdio: ['ignore', 'ignore', 'inherit'],
+  });
 };
