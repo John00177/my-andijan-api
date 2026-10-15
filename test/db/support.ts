@@ -1,5 +1,5 @@
 import { JwtService } from '@nestjs/jwt';
-import { Prisma, PrismaClient, UserRole } from '@prisma/client';
+import { BusinessStatus, Prisma, PrismaClient, UserRole } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { execFileSync } from 'child_process';
 import { cpSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'fs';
@@ -7,6 +7,9 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { AuthService } from '../../src/auth/auth.service';
 import { AdminService } from '../../src/admin/admin.service';
+import { EventsService } from '../../src/events/events.service';
+import { HealthScoreService } from '../../src/health-score/health-score.service';
+import { OwnerService } from '../../src/owner/owner.service';
 import { PrismaService } from '../../src/prisma/prisma.service';
 import { ReviewsService } from '../../src/reviews/reviews.service';
 import { SmsService } from '../../src/sms/sms.service';
@@ -158,9 +161,49 @@ export async function resetDatabase(prisma: PrismaClient): Promise<void> {
   const db = RUNTIME_ROLE
     ? (fixtureAdmin ??= new PrismaClient({ datasources: { db: { url: testDatabaseUrl() } } }))
     : prisma;
+  // The catalogue fixtures (Phase 16H claim suite) are listed explicitly:
+  // categories and business types reference no user, so CASCADE from "users"
+  // alone would leave them behind for the next suite.
   await db.$executeRawUnsafe(
-    'TRUNCATE TABLE "refresh_tokens", "auth_sessions", "audit_logs", "otp_codes", "users" RESTART IDENTITY CASCADE',
+    'TRUNCATE TABLE "refresh_tokens", "auth_sessions", "audit_logs", "otp_codes", "users", ' +
+      '"business_claims", "businesses", "business_types", "categories" RESTART IDENTITY CASCADE',
   );
+}
+
+/** Exit code of `prisma migrate diff` from a live database to prisma/schema.prisma (0 = identical). */
+export function schemaDriftExitCode(url: string): number {
+  try {
+    execFileSync(
+      'npx',
+      [
+        'prisma',
+        'migrate',
+        'diff',
+        '--from-url',
+        url,
+        '--to-schema-datamodel',
+        join(REPO_ROOT, 'prisma', 'schema.prisma'),
+        '--exit-code',
+      ],
+      { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32', timeout: 120_000 },
+    );
+    return 0;
+  } catch (error) {
+    return (error as { status?: number }).status ?? -1;
+  }
+}
+
+/** An APPROVED, unowned listing — with its own category and type — that can be claimed (Phase 16H). */
+export async function claimableListing(prisma: PrismaClient, slug: string) {
+  const category = await prisma.category.create({
+    data: { slug: `cat-${slug}`, nameUz: 'Kafe', nameRu: 'Kafe', nameEn: 'Cafe' },
+  });
+  const type = await prisma.businessType.create({
+    data: { slug: `type-${slug}`, nameUz: 'Tur', nameRu: 'Tip', nameEn: 'Type' },
+  });
+  return prisma.business.create({
+    data: { slug, name: slug, categoryId: category.id, businessTypeId: type.id, status: BusinessStatus.APPROVED },
+  });
 }
 
 export const PASSWORD = 'correct-horse-battery';
@@ -177,6 +220,8 @@ export function services(prisma: PrismaClient) {
   return {
     auth: new AuthService(db, new JwtService({}), {} as SmsService, {} as UploadService),
     admin: new AdminService(db, {} as ReviewsService),
+    // createClaim touches none of the three collaborators.
+    owner: new OwnerService(db, {} as ReviewsService, {} as EventsService, {} as HealthScoreService),
   };
 }
 
@@ -200,6 +245,31 @@ export async function raceAtSessionLock<T>(
       started = run();
       started.catch(() => undefined); // observed by the caller after release
       await waitForLockWaiters(prisma, 'auth_sessions', contenders);
+    },
+    { timeout: 20_000 },
+  );
+  return started;
+}
+
+/**
+ * raceAtSessionLock for a businesses row (Phase 16H): `run` starts while
+ * another transaction holds the row FOR UPDATE, and the lock is released only
+ * once `contenders` backends are observed blocked on a businesses row lock —
+ * claim filings at their FOR SHARE re-check, approvals at their owner UPDATE.
+ */
+export async function raceAtBusinessLock<T>(
+  prisma: PrismaClient,
+  businessId: number,
+  contenders: number,
+  run: () => Promise<T>,
+): Promise<T> {
+  let started!: Promise<T>;
+  await prisma.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT id FROM businesses WHERE id = ${businessId} FOR UPDATE`;
+      started = run();
+      started.catch(() => undefined); // observed by the caller after release
+      await waitForLockWaiters(prisma, 'businesses', contenders);
     },
     { timeout: 20_000 },
   );

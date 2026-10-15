@@ -19,6 +19,8 @@ describe('Business operations route authorization', () => {
       allowed: MOD_UP,
       routes: {
         'GET /admin/businesses': AdminController.prototype.findBusinesses,
+        // Phase 16E: the review drawer's full listing — same capability as the queue.
+        'GET /admin/businesses/:id': AdminController.prototype.findBusinessById,
         'POST /admin/businesses/:id/approve': AdminController.prototype.approveBusiness,
         'POST /admin/businesses/:id/reject': AdminController.prototype.rejectBusiness,
       },

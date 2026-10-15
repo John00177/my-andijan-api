@@ -59,6 +59,16 @@ export class AdminController {
     return this.adminService.findBusinesses(query, viewer.role);
   }
 
+  // `business.review` (Phase 16E): one listing in full for the review drawer —
+  // every non-deleted branch with hours, photos and coordinates, any status.
+  // Same owner phone/email shaping as the queue. Read-only, so no
+  // conflict-of-interest check: approve/reject still refuse your own listing.
+  @RequireCapability('business.review')
+  @Get('businesses/:id')
+  findBusinessById(@Param('id', ParseIntPipe) id: number, @CurrentUser() viewer: AuthenticatedUser) {
+    return this.adminService.findBusinessById(id, viewer.role);
+  }
+
   // `business.review`, and never on a listing the moderator owns (conflict
   // of interest, enforced in the service — D-75).
   @RequireCapability('business.review')
