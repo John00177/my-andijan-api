@@ -49,14 +49,10 @@ import {
   assertNotOwnReportMatter,
   assertNotOwnReviewMatter,
 } from '../authz/policies';
-
-function slugify(input: string): string {
-  return input
-    .toLowerCase()
-    .replace(/['’ʻʼ`]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
+// Shared since Phase 16F.2: transliterates Cyrillic category names instead of
+// deleting them. Categories are looked up by slug only, never by id, so the
+// all-digits rule in slugBase is not needed here.
+import { slugify } from '../common/slug';
 
 // Contact details (owner phone/email, reporter names) are shaped by the
 // `user.pii.read` capability (D-72, D-75): MODERATOR lacks it, ADMIN and
@@ -188,6 +184,60 @@ export class AdminService {
     ]);
 
     return { data, meta: paginate(page, limit, total) };
+  }
+
+  // MODERATOR+ (`business.review`, Phase 16E). One listing in full, for the
+  // review drawer: GET /businesses/:id serves only APPROVED listings and
+  // GET /me/businesses/:id only the owner, so staff had no way to see a
+  // PENDING listing's hours, photos, other branches or coordinates before
+  // deciding. Any status except soft-deleted; same owner-contact shaping as
+  // the queue (D-72). Deliberately a read-only projection: no products,
+  // events or reviews, and photos without their uploader.
+  async findBusinessById(id: number, viewerRole: UserRole) {
+    const ownerSelect = canSeeContactDetails(viewerRole)
+      ? { id: true, fullName: true, phone: true, email: true }
+      : { id: true, fullName: true };
+
+    const business = await this.prisma.business.findFirst({
+      where: { id, deletedAt: null },
+      include: {
+        owner: { select: ownerSelect },
+        category: { select: { id: true, slug: true, nameUz: true } },
+        businessType: { select: { id: true, slug: true, nameUz: true } },
+        branches: {
+          where: { deletedAt: null },
+          // Primary first — the branch the admin hours/branch edits target.
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            address: true,
+            landmark: true,
+            phone: true,
+            phoneAlt: true,
+            lat: true,
+            lng: true,
+            isPrimary: true,
+            isActive: true,
+            district: { select: { id: true, slug: true, nameUz: true } },
+            city: { select: { id: true, slug: true, nameUz: true } },
+            hours: {
+              orderBy: { dayOfWeek: 'asc' },
+              select: { dayOfWeek: true, openTime: true, closeTime: true, isClosed: true, is24Hours: true },
+            },
+            // Explicit select: never the uploader (uploadedById) or storage ids.
+            photos: {
+              orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+              select: { url: true, thumbUrl: true, caption: true, isPrimary: true, sortOrder: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!business) throw new NotFoundException(`Business ${id} not found`);
+    return business;
   }
 
   async approveBusiness(id: number, adminId: number) {
@@ -668,9 +718,25 @@ export class AdminService {
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
+        // Phase 16E.1 review context: what a reviewer needs to judge a claim
+        // before acting on it — whether the listing is still live and
+        // unowned, how many claims are competing for it (a hijacking signal),
+        // and whether the claimant's account is still active. Read-only
+        // state, no new PII: `claim.review` holders already see contact
+        // details here.
         include: {
-          business: { select: { id: true, slug: true, name: true, ownerId: true } },
-          claimant: { select: { id: true, fullName: true, phone: true, email: true, role: true } },
+          business: {
+            select: {
+              id: true,
+              slug: true,
+              name: true,
+              ownerId: true,
+              status: true,
+              deletedAt: true,
+              _count: { select: { claims: { where: { status: ClaimStatus.PENDING } } } },
+            },
+          },
+          claimant: { select: { id: true, fullName: true, phone: true, email: true, role: true, status: true } },
           reviewedBy: { select: { id: true, fullName: true } },
         },
       }),

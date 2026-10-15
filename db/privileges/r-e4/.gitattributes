@@ -1,0 +1,3 @@
+# SIG Gate 2 R-E4 tooling runs under bash/sh, which breaks on CRLF line
+# endings; keep LF in every checkout (Windows clones use core.autocrlf=true).
+* text eol=lf
