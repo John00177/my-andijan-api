@@ -25,5 +25,5 @@ Claude Code instructions for this repository. **Read [`AGENTS.md`](AGENTS.md) fi
 - **Preserve branch protection; never bypass CI.** Branch → PR → `test-and-build` → review. Commit/push only when asked.
 - **Never claim deployment unless independently verified** — a Railway deployment record for that exact SHA, plus a live probe for behaviour. **Railway production is currently blocked** (see `CURRENT_STATE.md`); merged API work is not live.
 - **No production mutation, no secrets** — see `AGENTS.md`. Never read, echo or commit `.env`.
-- **Record durable outcomes in canonical memory** after a major session (`intelligence/MEMORY_CONTRACT.md` §4) — in a `docs/` PR in `myandijan-frontend`, because this repo does not hold the memory. Skip it for trivial work.
+- **Run the memory-impact check after every material change** (`intelligence/MEMORY_CONTRACT.md` §4.1, frontend repo) — implementation, architecture, security, database, API, product, phase or deployment state. If material, the memory update is a follow-up `docs/` PR in `myandijan-frontend`, because this repo does not hold the memory; skip trivial, read-only or no-change work. End the final report with `memory impact: updated` + files (or the pending `docs/` PR), or `memory impact: none` + why.
 - Your conversation and Claude's auto-memory are working memory, not project truth.
