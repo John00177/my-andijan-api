@@ -204,6 +204,53 @@ export class OwnerService {
     return updated;
   }
 
+  // Phase 16I (16D remainder, D-79): the owner's way back from REJECTED. The
+  // owner fixes the listing through PATCH /me/businesses/:id (open in every
+  // status), then sends it back to the moderation queue here. This is the only
+  // status transition an owner makes, and only REJECTED -> PENDING; every
+  // other move belongs to staff. rejectionReason is kept, not cleared: it is
+  // the moderator's context for the re-review (approve clears it, a second
+  // reject overwrites it), and the owner UI shows it only on REJECTED and
+  // SUSPENDED listings.
+  async resubmitMyBusiness(userId: number, id: number) {
+    return this.prisma.$transaction(async (tx) => {
+      const business = await tx.business.findFirst({ where: { id, ownerId: userId, deletedAt: null } });
+      if (!business) {
+        throw new NotFoundException(`Business ${id} not found`);
+      }
+      if (business.status !== BusinessStatus.REJECTED) {
+        throw new ConflictException(
+          `Only a rejected listing can be resubmitted (current status: ${business.status})`,
+        );
+      }
+
+      // Compare-and-set (D-60): a double submit, or a SUPER_ADMIN hiding the
+      // listing in between, must not be overwritten by a stale read.
+      const { count } = await tx.business.updateMany({
+        where: { id, ownerId: userId, status: BusinessStatus.REJECTED, deletedAt: null },
+        data: { status: BusinessStatus.PENDING },
+      });
+      if (count === 0) {
+        throw new ConflictException(`Business ${id} changed status concurrently`);
+      }
+
+      // Audited like the staff decisions it answers, in the same transaction.
+      await tx.auditLog.create({
+        data: {
+          ...auditRequestFields(),
+          actorId: userId,
+          action: AuditAction.UPDATE,
+          entityType: 'Business',
+          entityId: id,
+          before: { status: business.status, rejectionReason: business.rejectionReason } as Prisma.InputJsonValue,
+          after: { status: BusinessStatus.PENDING, resubmitted: true } as Prisma.InputJsonValue,
+        },
+      });
+
+      return tx.business.findUniqueOrThrow({ where: { id } });
+    });
+  }
+
   private async generateUniqueBusinessSlug(name: string): Promise<string> {
     // Cyrillic transliterated, never empty, never all digits (Phase 16F.2).
     const base = slugBase(name, 'business');

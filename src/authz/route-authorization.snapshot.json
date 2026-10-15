@@ -116,6 +116,7 @@
   "POST /favorites": "authenticated",
   "POST /me/businesses": "capability:business.create",
   "POST /me/businesses/:id/branches": "capability:business.manage_own",
+  "POST /me/businesses/:id/resubmit": "capability:business.manage_own",
   "POST /me/claims": "capability:business.claim",
   "POST /me/events": "capability:business.manage_own",
   "POST /me/health-score/recommendations/:id/complete": "capability:business.manage_own",

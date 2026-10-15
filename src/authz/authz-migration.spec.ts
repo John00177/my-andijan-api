@@ -156,6 +156,9 @@ const LEGACY: Record<string, Legacy> = {
   // Phase 16E: the review drawer's listing detail, joining the MODERATOR
   // business queue (GET /admin/businesses, approve, reject).
   'GET /admin/businesses/:id': 'MODERATOR',
+  // Phase 16I: an owner resubmitting a REJECTED listing, joining the
+  // /me/businesses owner group (signed-in floor under the rank model).
+  'POST /me/businesses/:id/resubmit': 'auth',
 };
 
 function legacyDecision(rule: Legacy, role: UserRole | null): 'allow' | 'unauthenticated' | 'forbidden' {
@@ -188,6 +191,7 @@ const OWNER_ROUTES = [
   'POST /me/businesses',
   'GET /me/businesses/:id',
   'PATCH /me/businesses/:id',
+  'POST /me/businesses/:id/resubmit',
   'POST /me/businesses/:id/branches',
   'PATCH /me/branches/:id',
   'GET /me/reviews',
