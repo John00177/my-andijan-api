@@ -101,14 +101,20 @@ export function migrationsWorkDir(
 
 /**
  * `prisma migrate deploy` of a work dir against a scratch database. DATABASE_URL
- * is set explicitly for the child, so no .env file can redirect it. Returns the
- * outcome instead of throwing; output is kept for assertions, never printed.
+ * and MIGRATION_DATABASE_URL (the schema's directUrl, which migrations use — SIG
+ * Gate 2 Phase C) are set explicitly for the child, so no .env file can redirect
+ * them; by default both are `databaseUrl`. Returns the outcome instead of
+ * throwing; output is kept for assertions, never printed.
  */
-export function deployMigrations(workDir: string, databaseUrl: string): { ok: boolean; output: string } {
+export function deployMigrations(
+  workDir: string,
+  databaseUrl: string,
+  migrationUrl: string = databaseUrl,
+): { ok: boolean; output: string } {
   try {
     const output = execFileSync('npx', ['prisma', 'migrate', 'deploy', '--schema', join(workDir, 'schema.prisma')], {
       cwd: REPO_ROOT,
-      env: { ...process.env, DATABASE_URL: databaseUrl },
+      env: { ...process.env, DATABASE_URL: databaseUrl, MIGRATION_DATABASE_URL: migrationUrl },
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: process.platform === 'win32', // npx is a .cmd shim on Windows
       timeout: 120_000,
